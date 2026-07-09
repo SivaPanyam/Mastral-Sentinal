@@ -138,6 +138,10 @@ class KnowledgeSourceRepository:
         return db.query(KnowledgeSource).filter(KnowledgeSource.id == document_id).first()
 
     @staticmethod
+    def get_by_checksum(db: Session, checksum: str) -> Optional[KnowledgeSource]:
+        return db.query(KnowledgeSource).filter(KnowledgeSource.checksum == checksum).first()
+
+    @staticmethod
     def update(db: Session, source: KnowledgeSource) -> KnowledgeSource:
         db.add(source)
         db.commit()

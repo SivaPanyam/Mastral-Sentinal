@@ -21,6 +21,7 @@ from .base import Base, AuditMixin                          # noqa: F401
 # 2. Models with no foreign-key dependencies
 from .user        import User                               # noqa: F401
 from .audit_log   import AuditLog                          # noqa: F401
+from .metric      import Metric                            # noqa: F401
 
 # 3. Core domain model (declares the M:N association table)
 from .incident        import Incident, incident_knowledge_association   # noqa: F401

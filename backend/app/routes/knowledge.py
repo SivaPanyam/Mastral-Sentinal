@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, BackgroundTasks
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from app.database import get_db
@@ -9,6 +9,9 @@ from app.crud import KnowledgeSourceRepository
 from app.auth import require_role
 from app.config import settings
 import uuid
+import os
+import tempfile
+import shutil
 
 router = APIRouter(prefix="/knowledge", tags=["Knowledge Base"])
 
@@ -42,6 +45,82 @@ def add_document(doc_in: KnowledgeSourceCreate, db: Session = Depends(get_db), c
     )
     
     return KnowledgeSourceRepository.create(db, new_doc)
+
+def _background_index_document(doc_id: str, title: str, content: str, metadata: dict, db: Session):
+    try:
+        rag_manager.index_document(doc_id=doc_id, title=title, content=content, metadata=metadata)
+        doc = KnowledgeSourceRepository.get_by_id(db, doc_id)
+        if doc:
+            doc.ingestion_status = "COMPLETED"
+            KnowledgeSourceRepository.update(db, doc)
+    except Exception as e:
+        print(f"Background indexing failed for {doc_id}: {e}")
+        doc = KnowledgeSourceRepository.get_by_id(db, doc_id)
+        if doc:
+            doc.ingestion_status = "FAILED"
+            KnowledgeSourceRepository.update(db, doc)
+
+@router.post("/upload", response_model=KnowledgeSourceOut, status_code=status.HTTP_201_CREATED)
+def upload_document(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user = Depends(require_role(["Admin", "SRE", "DevOps"]))
+):
+    """Upload a document (PDF, TXT, MD, DOCX), extract metadata, and index in background."""
+    ext = file.filename.split('.')[-1].lower()
+    if ext not in ["txt", "md", "pdf", "docx"]:
+        raise HTTPException(status_code=400, detail="Unsupported file format")
+
+    # Save to temp file
+    temp_fd, temp_path = tempfile.mkstemp(suffix=f".{ext}")
+    try:
+        with os.fdopen(temp_fd, 'wb') as f:
+            shutil.copyfileobj(file.file, f)
+            
+        # Parse and extract metadata
+        parsed_data = rag_manager.ingest_file(temp_path)
+        content_hash = parsed_data["content_hash"]
+        
+        # Check duplicates
+        existing = KnowledgeSourceRepository.get_by_checksum(db, content_hash)
+        if existing:
+            return existing
+
+        doc_id = parsed_data["doc_id"]
+        metadata = parsed_data["metadata"]
+        
+        # Create DB record
+        new_doc = KnowledgeSource(
+            id=doc_id,
+            title=parsed_data["title"],
+            type=metadata.get("type", "UNKNOWN"),
+            service=metadata.get("service", "unknown"),
+            content=parsed_data["content"],
+            vectorId=doc_id,
+            checksum=content_hash,
+            ingestion_status="PROCESSING",
+            source_path=file.filename,
+            uploadedBy=current_user.id
+        )
+        
+        created_doc = KnowledgeSourceRepository.create(db, new_doc)
+        
+        # Schedule background indexing
+        background_tasks.add_task(
+            _background_index_document,
+            doc_id=doc_id,
+            title=parsed_data["title"],
+            content=parsed_data["content"],
+            metadata=metadata,
+            db=db
+        )
+        
+        return created_doc
+        
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
 
 @router.get("/search")

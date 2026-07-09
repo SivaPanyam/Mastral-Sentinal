@@ -42,6 +42,7 @@ interface AppContextType {
   // Search Knowledge
   searchKB: (query: string) => Promise<void>;
   addKBDoc: (doc: Omit<KnowledgeDocument, 'id' | 'lastUpdated'>) => Promise<void>;
+  uploadKBDoc: (file: File) => Promise<void>;
 
   // Global SRE Notifications Feed
   notifications: Array<{ id: string; timestamp: string; text: string; type: 'info' | 'warn' | 'error' }>;
@@ -303,7 +304,18 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const addKBDoc = async (docData: Omit<KnowledgeDocument, 'id' | 'lastUpdated'>) => {
     const newDoc = await knowledgeService.createDocument(docData);
     setKnowledgeDocs(prev => [newDoc, ...prev]);
-    addNotification(`Archived resolved incident playbook to KB: ${newDoc.id}`, 'info');
+    addNotification(`Indexed new ${docData.type}: ${docData.title}`, 'info');
+  };
+
+  const uploadKBDoc = async (file: File) => {
+    addNotification(`Uploading and indexing document: ${file.name}...`, 'info');
+    const newDoc = await knowledgeService.uploadDocument(file);
+    if (newDoc) {
+      setKnowledgeDocs(prev => [newDoc, ...prev]);
+      addNotification(`Successfully uploaded and indexed ${file.name}`, 'info');
+    } else {
+      addNotification(`Failed to upload ${file.name}`, 'error');
+    }
   };
 
   return (
@@ -330,6 +342,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         resetAgentPipeline,
         searchKB,
         addKBDoc,
+        uploadKBDoc,
         notifications,
         addNotification,
       }}

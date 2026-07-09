@@ -238,5 +238,26 @@ export const incidentService = {
     }
     mockLogs[incidentId].push(newLog);
     return newLog;
+  },
+
+  uploadBulkLogs: async (incidentId: string, file: File): Promise<any> => {
+    try {
+      const token = localStorage.getItem('mastra_token');
+      const formData = new FormData();
+      formData.append('file', file);
+      
+      const response = await fetch(`/api/v1/incidents/${incidentId}/logs/upload`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`
+        },
+        body: formData
+      });
+      if (!response.ok) throw new Error('Bulk upload failed');
+      return await response.json();
+    } catch (e) {
+      console.error('Bulk log upload failed:', e);
+      return null;
+    }
   }
 };

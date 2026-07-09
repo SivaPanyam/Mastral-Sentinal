@@ -1,5 +1,8 @@
 import os
 import uuid
+import hashlib
+import json
+import re
 from typing import List, Dict, Any, Optional
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
@@ -86,8 +89,24 @@ class RAGService:
             start = end - overlap
         return chunks
 
-    def ingest_file(self, file_path: str, metadata: Dict[str, Any]):
-        """Production pipeline for extracting text from TXT, MD, PDF and indexing."""
+    def extract_metadata(self, text: str) -> Dict[str, str]:
+        if not self.embedder.client:
+            return {"title": "Unknown Document", "service": "unknown", "type": "UNKNOWN"}
+        try:
+            prompt = "Analyze the following document and extract metadata. Return a JSON object with 'title', 'service', and 'type'. The 'type' must be one of: RUNBOOK, POST_MORTEM, ARCHITECTURE, PLAYBOOK, WIKI. Document: " + text[:2000]
+            response = self.embedder.client.models.generate_content(
+                model='gemini-1.5-flash',
+                contents=prompt
+            )
+            json_str = re.search(r'\{.*\}', response.text, re.DOTALL)
+            if json_str:
+                return json.loads(json_str.group(0))
+        except Exception as e:
+            print(f"Metadata extraction failed: {e}")
+        return {"title": "Unknown Document", "service": "unknown", "type": "UNKNOWN"}
+
+    def ingest_file(self, file_path: str, metadata: Dict[str, Any] = None):
+        """Production pipeline for extracting text from TXT, MD, PDF, DOCX and indexing."""
         ext = file_path.split('.')[-1].lower()
         content = ""
         
@@ -103,12 +122,24 @@ class RAGService:
                         content += extracted + "\n"
             except Exception as e:
                 print(f"Error reading PDF {file_path}: {e}")
+        elif ext == "docx":
+            try:
+                from docx import Document
+                doc = Document(file_path)
+                content = "\n".join([para.text for para in doc.paragraphs])
+            except Exception as e:
+                print(f"Error reading DOCX {file_path}: {e}")
         else:
             raise ValueError(f"Unsupported file type: {ext}")
 
+        content_hash = hashlib.sha256(content.encode('utf-8')).hexdigest()
+        if not metadata:
+            metadata = self.extract_metadata(content)
+
         doc_id = metadata.get("doc_id", f"FILE-{uuid.uuid4().hex[:8]}")
         title = metadata.get("title", os.path.basename(file_path))
-        self.index_document(doc_id=doc_id, title=title, content=content, metadata=metadata)
+        
+        return {"doc_id": doc_id, "content_hash": content_hash, "metadata": metadata, "content": content, "title": title}
 
     def index_document(self, doc_id: str, title: str, content: str, metadata: Dict[str, Any]):
         """Chunks document, calls EmbeddingService, and stores in QdrantService."""
@@ -128,8 +159,11 @@ class RAGService:
             point_id = hash(f"{doc_id}_{i}") % (10**8)
             points.append(qmodels.PointStruct(id=point_id, vector=vector, payload=payload))
             
+        batch_size = 100
         if points:
-            self.qdrant.upsert_points(points)
+            for i in range(0, len(points), batch_size):
+                batch = points[i:i+batch_size]
+                self.qdrant.upsert_points(batch)
 
     def query_sop_runbooks(self, query: str, limit: int = 3) -> List[Dict[str, Any]]:
         """Maintains the legacy interface expected by workflows.py."""

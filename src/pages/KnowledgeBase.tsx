@@ -6,7 +6,7 @@ import { KnowledgeType } from '../types';
 import { BookOpen, Plus, Database, X } from 'lucide-react';
 
 export const KnowledgeBase: React.FC = () => {
-  const { knowledgeDocs, searchKB, addKBDoc, systemOverview } = useApp();
+  const { knowledgeDocs, searchKB, addKBDoc, uploadKBDoc, systemOverview } = useApp();
   const [searchQuery, setSearchQuery] = useState('');
   const [showCreateModal, setShowCreateModal] = useState(false);
 
@@ -57,13 +57,26 @@ export const KnowledgeBase: React.FC = () => {
           <p className="text-slate-400 text-xs font-sans mt-0.5">Automated RAG vector storage index of cluster runbooks and resolved RCAs.</p>
         </div>
 
-        <button
-          onClick={() => setShowCreateModal(true)}
-          className="flex items-center gap-1.5 bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold px-3.5 py-2 rounded-lg border border-blue-500 shadow-md shadow-blue-500/10 transition-all cursor-pointer font-sans"
-        >
-          <Plus className="w-3.5 h-3.5" />
-          Author SOP/Runbook
-        </button>
+        <div className="flex items-center gap-2">
+          <label className="flex items-center gap-1.5 bg-slate-800 hover:bg-slate-700 text-white text-xs font-semibold px-3.5 py-2 rounded-lg border border-slate-700 transition-all cursor-pointer font-sans">
+            <input type="file" className="hidden" accept=".txt,.md,.pdf,.docx" onChange={(e) => {
+              const file = e.target.files?.[0];
+              if (file) {
+                uploadKBDoc(file);
+                e.target.value = '';
+              }
+            }} />
+            <BookOpen className="w-3.5 h-3.5" />
+            Upload File
+          </label>
+          <button
+            onClick={() => setShowCreateModal(true)}
+            className="flex items-center gap-1.5 bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold px-3.5 py-2 rounded-lg border border-blue-500 shadow-md shadow-blue-500/10 transition-all cursor-pointer font-sans"
+          >
+            <Plus className="w-3.5 h-3.5" />
+            Author SOP/Runbook
+          </button>
+        </div>
       </div>
 
       {/* Stats/Search Row */}

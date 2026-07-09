@@ -295,3 +295,20 @@ def copilot_chat(req: ChatRequest, db: Session = Depends(get_db), current_user =
             "outputThreats": output_scan["threats"]
         }
     )
+
+class GuardrailRequest(BaseModel):
+    text: str
+    direction: str = "input"
+
+@router.post("/guardrail-check")
+def check_guardrails(req: GuardrailRequest, current_user = Depends(get_current_user)):
+    """Run Enkrypt guardrails independently."""
+    if req.direction == "input":
+        scan = EnkryptMiddleware.validate_input(req.text)
+    else:
+        scan = EnkryptMiddleware.validate_output(req.text)
+    
+    return {
+        "status": scan.get("status", "PASSED"),
+        "threats": scan.get("threats", [])
+    }

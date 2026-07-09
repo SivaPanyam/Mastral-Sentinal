@@ -18,10 +18,8 @@ export const knowledgeSearchTool = createTool({
   }),
   execute: async ({ context }) => {
     try {
-      const response = await axios.post(`${FASTAPI_URL}/knowledge/query`, {
-        query: context.query
-      }, {
-        params: { limit: context.limit }
+      const response = await axios.get(`${FASTAPI_URL}/knowledge/search`, {
+        params: { query: context.query, limit: context.limit }
       });
       return response.data;
     } catch (error: any) {

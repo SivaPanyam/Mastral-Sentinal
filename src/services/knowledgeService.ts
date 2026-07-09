@@ -175,5 +175,29 @@ export const knowledgeService = {
     };
     mockKnowledgeDocuments = [newDoc, ...mockKnowledgeDocuments];
     return newDoc;
+  },
+
+  uploadDocument: async (file: File): Promise<KnowledgeDocument | null> => {
+    try {
+      const token = localStorage.getItem('mastra_token');
+      const formData = new FormData();
+      formData.append('file', file);
+      
+      const response = await fetch('/api/v1/knowledge/upload', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`
+        },
+        body: formData
+      });
+      if (!response.ok) throw new Error('Upload failed');
+      const data = await response.json();
+      const mapped = mapApiKnowledgeDoc(data);
+      mockKnowledgeDocuments = [mapped, ...mockKnowledgeDocuments];
+      return mapped;
+    } catch (e) {
+      console.error('File upload failed:', e);
+      return null;
+    }
   }
 };

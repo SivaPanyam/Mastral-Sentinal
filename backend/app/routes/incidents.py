@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, UploadFile, File
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from typing import List, Dict, Any, Optional
@@ -14,6 +14,10 @@ import uuid
 import asyncio
 import json
 import requests
+import pandas as pd
+import tempfile
+import os
+import shutil
 
 router = APIRouter(prefix="/incidents", tags=["Incidents"])
 
@@ -139,6 +143,80 @@ def append_incident_log(incident_id: str, log_in: IncidentLogCreate, db: Session
     db.commit()
     db.refresh(new_log)
     return new_log
+
+
+@router.post("/{incident_id}/logs/upload")
+def upload_logs(incident_id: str, file: UploadFile = File(...), db: Session = Depends(get_db), current_user = Depends(require_role(["Admin", "SRE", "DevOps"]))):
+    """Bulk ingest logs from CSV, JSON, or TXT."""
+    incident = IncidentRepository.get_by_id(db, incident_id)
+    if not incident:
+        raise HTTPException(status_code=404, detail="Incident not found")
+        
+    ext = file.filename.split('.')[-1].lower()
+    if ext not in ["csv", "json", "txt"]:
+        raise HTTPException(status_code=400, detail="Unsupported file format. Use CSV, JSON, or TXT.")
+
+    temp_fd, temp_path = tempfile.mkstemp(suffix=f".{ext}")
+    try:
+        with os.fdopen(temp_fd, 'wb') as f:
+            shutil.copyfileobj(file.file, f)
+            
+        logs_to_insert = []
+        if ext == "csv":
+            df = pd.read_csv(temp_path)
+            for _, row in df.iterrows():
+                msg = str(row.get("message", ""))
+                # simple enkrypt rule
+                if "api_key" in msg.lower() or "password" in msg.lower():
+                    msg = EnkryptMiddleware.encrypt_data(msg)
+                logs_to_insert.append(IncidentLog(
+                    id=f"log-{uuid.uuid4().hex[:6]}",
+                    incidentId=incident_id,
+                    source=str(row.get("source", "uploaded_csv")),
+                    level=str(row.get("level", "INFO")).upper(),
+                    message=msg
+                ))
+        elif ext == "json":
+            with open(temp_path, "r") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    for item in data:
+                        msg = str(item.get("message", ""))
+                        if "api_key" in msg.lower() or "password" in msg.lower():
+                            msg = EnkryptMiddleware.encrypt_data(msg)
+                        logs_to_insert.append(IncidentLog(
+                            id=f"log-{uuid.uuid4().hex[:6]}",
+                            incidentId=incident_id,
+                            source=str(item.get("source", "uploaded_json")),
+                            level=str(item.get("level", "INFO")).upper(),
+                            message=msg
+                        ))
+        elif ext == "txt":
+            with open(temp_path, "r") as f:
+                for line in f:
+                    if line.strip():
+                        msg = line.strip()
+                        if "api_key" in msg.lower() or "password" in msg.lower():
+                            msg = EnkryptMiddleware.encrypt_data(msg)
+                        logs_to_insert.append(IncidentLog(
+                            id=f"log-{uuid.uuid4().hex[:6]}",
+                            incidentId=incident_id,
+                            source="uploaded_txt",
+                            level="INFO",
+                            message=msg
+                        ))
+                        
+        if logs_to_insert:
+            db.add_all(logs_to_insert)
+            db.commit()
+            
+        return {"status": "success", "logs_inserted": len(logs_to_insert)}
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
 
 @router.post("/{incident_id}/trigger-pipeline")

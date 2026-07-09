@@ -1,6 +1,7 @@
 import React, { useState, useRef } from 'react';
 import { useApp } from '../context/AppContext';
 import { UploadCloud, FileText, CheckCircle2, AlertTriangle, Terminal } from 'lucide-react';
+import { incidentService } from '../services/incidentService';
 
 interface LogUploaderProps {
   incidentId: string;
@@ -27,23 +28,20 @@ export const LogUploader: React.FC<LogUploaderProps> = ({ incidentId }) => {
 
   const processLogFile = async (file: File) => {
     try {
-      const text = await file.text();
-      // Inject some parsed lines of logs
-      const lines = text.split('\n').filter(l => l.trim().length > 0).slice(0, 5);
-      
-      for (const line of lines) {
-        await addIncidentLog(incidentId, line, file.name, 'ERROR');
+      const res = await incidentService.uploadBulkLogs(incidentId, file);
+      if (res && res.status === 'success') {
+        setUploadStatus({
+          type: 'success',
+          text: `Successfully injected ${res.logs_inserted} lines of telemetry logs from ${file.name}.`
+        });
+      } else {
+        throw new Error('Upload failed');
       }
-
-      setUploadStatus({
-        type: 'success',
-        text: `Successfully injected ${lines.length} lines of telemetry logs from ${file.name}.`
-      });
       setTimeout(() => setUploadStatus(null), 4000);
     } catch (err) {
       setUploadStatus({
         type: 'error',
-        text: 'Failed to read log file. Ensure it is a valid text/plain document.'
+        text: 'Failed to read log file. Ensure it is a valid CSV, JSON, or TXT document.'
       });
     }
   };

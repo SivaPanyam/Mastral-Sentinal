@@ -22,7 +22,7 @@ from app.schemas import (
     MetricPointOut,
     SystemOverviewOut
 )
-from app.routes import incidents, agents, knowledge, reports, copilot, users, settings as settings_routes, audit_logs
+from app.routes import incidents, agents, knowledge, reports, copilot, users, settings as settings_routes, audit_logs, metrics, seeder
 from app.models import User, Incident, KnowledgeSource, Report
 from app.crud import UserRepository
 from typing import List, Dict, Any
@@ -153,6 +153,8 @@ app.include_router(copilot.router, prefix=settings.API_V1_STR)
 app.include_router(users.router, prefix=settings.API_V1_STR)
 app.include_router(settings_routes.router, prefix=settings.API_V1_STR)
 app.include_router(audit_logs.router, prefix=settings.API_V1_STR)
+app.include_router(metrics.router, prefix=settings.API_V1_STR)
+app.include_router(seeder.router, prefix=settings.API_V1_STR)
 
 
 @app.get("/health", tags=["Platform Health"])
