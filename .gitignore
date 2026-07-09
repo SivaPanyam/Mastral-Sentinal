@@ -1,0 +1,26 @@
+# Logs and caches
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.venv/
+venv/
+ENV/
+
+# Databases
+*.db
+*.sqlite3
+
+# Qdrant files
+qdrant_storage/

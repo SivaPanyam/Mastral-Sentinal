@@ -1,0 +1,6 @@
+{
+  "name": "Mastra Sentinel",
+  "description": "An AI-powered Incident Intelligence Platform for DevOps, SRE, and Security teams.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
