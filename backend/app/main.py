@@ -44,12 +44,13 @@ def seed_users():
     db = next(get_db())
     try:
         # Seed Admin
-        admin = UserRepository.get_by_email(db, "sivapanyam1@gmail.com")
+        admin = UserRepository.get_by_email(db, "admin@sentinel.dev")
         if not admin:
             admin_user = User(
                 id="usr-admin",
-                email="sivapanyam1@gmail.com",
-                name="Siva Panyam",
+                username="admin",
+                email="admin@sentinel.dev",
+                name="Admin User",
                 hashed_password=get_password_hash("SreSentinel2026!"),
                 role="Admin"
             )
@@ -64,6 +65,7 @@ def seed_users():
         if not operator:
             operator_user = User(
                 id="usr-operator",
+                username="operator",
                 email="operator@sentinel.ai",
                 name="Operator Lead",
                 hashed_password=get_password_hash("OperatorSecure!"),
@@ -80,6 +82,7 @@ def seed_users():
         if not analyst:
             analyst_user = User(
                 id="usr-analyst",
+                username="analyst",
                 email="analyst@sentinel.ai",
                 name="Security Analyst",
                 hashed_password=get_password_hash("AnalystSecure!"),
@@ -96,6 +99,7 @@ def seed_users():
         if not devops:
             devops_user = User(
                 id="usr-devops",
+                username="devops",
                 email="devops@sentinel.ai",
                 name="DevOps Engineer",
                 hashed_password=get_password_hash("DevopsSecure!"),
@@ -112,6 +116,7 @@ def seed_users():
         if not viewer:
             viewer_user = User(
                 id="usr-viewer",
+                username="viewer",
                 email="viewer@sentinel.ai",
                 name="Guest Viewer",
                 hashed_password=get_password_hash("ViewerSecure!"),
@@ -156,6 +161,12 @@ app.include_router(audit_logs.router, prefix=settings.API_V1_STR)
 app.include_router(metrics.router, prefix=settings.API_V1_STR)
 app.include_router(seeder.router, prefix=settings.API_V1_STR)
 
+
+from fastapi.responses import RedirectResponse
+
+@app.get("/", include_in_schema=False)
+def root():
+    return RedirectResponse(url="/api/docs")
 
 @app.get("/health", tags=["Platform Health"])
 def health_check():

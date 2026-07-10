@@ -19,7 +19,10 @@ from app.config import settings
 config = context.config
 
 # Dynamically set the SQLAlchemy database URL from application settings
-config.set_main_option("sqlalchemy.url", settings.get_database_url())
+db_url = settings.get_database_url()
+if db_url:
+    db_url = db_url.replace('%', '%%')
+config.set_main_option("sqlalchemy.url", db_url)
 
 # Interpret the config file for Python logging.
 if config.config_file_name is not None:

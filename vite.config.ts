@@ -16,12 +16,12 @@ export default defineConfig(() => {
       host: '0.0.0.0',
       proxy: {
         '/api': {
-          target: 'http://127.0.0.1:8000',
+          target: 'http://backend:8000',
           changeOrigin: true,
           secure: false,
         },
         '/auth': {
-          target: 'http://127.0.0.1:8000',
+          target: 'http://backend:8000',
           changeOrigin: true,
           secure: false,
         }
@@ -29,6 +29,22 @@ export default defineConfig(() => {
       // HMR is disabled in AI Studio via DISABLE_HMR env var.
       hmr: process.env.DISABLE_HMR !== 'true',
       watch: process.env.DISABLE_HMR === 'true' ? null : {},
+    },
+    preview: {
+      port: 3000,
+      host: '0.0.0.0',
+      proxy: {
+        '/api': {
+          target: 'http://backend:8000',
+          changeOrigin: true,
+          secure: false,
+        },
+        '/auth': {
+          target: 'http://backend:8000',
+          changeOrigin: true,
+          secure: false,
+        }
+      }
     },
   };
 });

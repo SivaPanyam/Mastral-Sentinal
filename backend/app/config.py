@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 1 day
     
     # Core Integrations
-    GEMINI_API_KEY: str = "mock-gemini-key"
+    OLLAMA_BASE_URL: str = "http://host.docker.internal:11434"
     ENKRYPTAI_API_KEY: str = ""
     QDRANT_HOST: str = "localhost"
     QDRANT_PORT: int = 6333
@@ -34,6 +34,8 @@ class Settings(BaseSettings):
     def get_database_url(self) -> str:
         if self.DATABASE_URL:
             return self.DATABASE_URL
-        return f"postgresql+psycopg2://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@{self.POSTGRES_SERVER}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
+        import urllib.parse
+        encoded_password = urllib.parse.quote_plus(self.POSTGRES_PASSWORD)
+        return f"postgresql+psycopg2://{self.POSTGRES_USER}:{encoded_password}@{self.POSTGRES_SERVER}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
 
 settings = Settings()

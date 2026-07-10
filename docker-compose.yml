@@ -29,7 +29,7 @@ services:
     volumes:
       - ./backend:/app
     environment:
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL}
       - ENKRYPTAI_API_KEY=${ENKRYPTAI_API_KEY}
       - DATABASE_URL=${DATABASE_URL}
       - POSTGRES_SERVER=${POSTGRES_SERVER:-postgres}
@@ -43,7 +43,6 @@ services:
     depends_on:
       - postgres
       - qdrant
-      - mastra_engine
 
   # ---------------------------------------------
   # Mastra AI Agent Engine (Port 3001)
@@ -57,7 +56,7 @@ services:
       - "3001:3001"
     environment:
       - FASTAPI_URL=http://backend:8000/api/v1
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL}
       - MASTRA_PORT=3001
     depends_on:
       - backend

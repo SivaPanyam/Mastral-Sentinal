@@ -2,7 +2,7 @@
 
 > **Autonomous AI-Driven SRE Incident Response & Remediation Control Plane**
 
-Mastra Sentinel is an enterprise-grade AI-powered Incident Intelligence Platform designed for DevOps, SRE, and Security teams. It automates incident triage, correlation, remediation, and reporting using a coordinated multi-agent workflow powered by the Google Gemini API and Qdrant Vector Search (RAG).
+Mastra Sentinel is an enterprise-grade AI-powered Incident Intelligence Platform designed for DevOps, SRE, and Security teams. It automates incident triage, correlation, remediation, and reporting using a coordinated multi-agent workflow powered by **Local AI (Ollama Llama 3.2)** and Qdrant Vector Search (RAG).
 
 ---
 
@@ -12,8 +12,8 @@ The platform is structured into clean, modular tiers adhering to SOLID engineeri
 
 * **Presentation Tier**: A highly polished, single-view interactive SRE console built with React 19, TypeScript, Tailwind CSS, and Framer Motion.
 * **Core Application Tier**: A robust, secure FastAPI backend providing telemetry aggregation, relational database persistence (SQLAlchemy + PostgreSQL), and JWT user access controls.
-* **Agentic SRE Tier**: An autonomous Mastra Workflow DAG coordinating **5 dedicated SRE Agents** using the modern `@google/genai` model client.
-* **Vector Storage (RAG)**: A high-performance Qdrant similarity database containing Standard Operating Procedures (SOPs) and historical incident post-mortems.
+* **Agentic SRE Tier**: An autonomous Mastra Workflow DAG coordinating **5 dedicated SRE Agents** using local, private LLMs via Ollama.
+* **Vector Storage (RAG)**: A high-performance Qdrant similarity database containing Standard Operating Procedures (SOPs) and historical incident post-mortems encoded with `nomic-embed-text`.
 
 ---
 
@@ -46,7 +46,7 @@ Copy the environment template and insert your keys:
 cp .env.example .env
 ```
 
-Ensure `GEMINI_API_KEY` is configured for AI agent execution (the platform gracefully degrades to an offline rule-based heuristic engine if unconfigured).
+Ensure you have [Ollama](https://ollama.com/) running locally with `llama3.2` and `nomic-embed-text` models pulled (`ollama pull llama3.2` and `ollama pull nomic-embed-text`). The platform runs 100% locally with absolute data privacy. You can optionally add an `ENKRYPTAI_API_KEY` for enterprise AI guardrails, though it falls back to a local regex engine gracefully.
 
 ### 2. Launch the Stack
 ```bash
@@ -75,7 +75,7 @@ When an anomaly is logged, the platform orchestrates a sequential DAG of five de
 Telemetry logs often contain sensitive credentials. Our custom `EnkryptMiddleware` (located in `/backend/app/auth.py`) automatically intercepts logs, redacts credentials, and encrypts sensitive parameters in-transit before persisting them to disk.
 
 ### 3. Graceful Degraded Operations
-In high-pressure situations, external APIs can timeout. If the Google Gemini connection is unreachable, Mastra Sentinel automatically transitions to an offline rule-based SRE heuristic engine, guaranteeing absolute service uptime.
+In high-pressure situations, external APIs can timeout. Because Mastra Sentinel runs 100% locally with Ollama, you are protected from cloud vendor outages. Furthermore, if the Enkrypt AI Guardrails API is unreachable, the system automatically transitions to a robust offline regex-based security heuristic engine, guaranteeing absolute service uptime.
 
 ---
 

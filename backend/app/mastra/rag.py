@@ -3,32 +3,42 @@ import uuid
 import hashlib
 import json
 import re
+import time
+import requests
 from typing import List, Dict, Any, Optional
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
-from google import genai
 from pypdf import PdfReader
 from app.config import settings
+from app.ingestion.chunking import chunk_text
 
 class EmbeddingService:
     def __init__(self):
-        self.api_key = os.getenv("GEMINI_API_KEY", settings.GEMINI_API_KEY)
-        self.client = None
-        if self.api_key and self.api_key != "mock-gemini-key":
-            try:
-                self.client = genai.Client(api_key=self.api_key)
-            except Exception as e:
-                print(f"Failed to init Gemini in EmbeddingService: {e}")
+        self.base_url = os.getenv("OLLAMA_BASE_URL", settings.OLLAMA_BASE_URL)
+        if not self.base_url.endswith("/api/embeddings"):
+            self.endpoint = f"{self.base_url.rstrip('/')}/api/embeddings"
+        else:
+            self.endpoint = self.base_url
 
-    def get_embedding(self, text: str) -> List[float]:
-        if not self.client:
-            raise ValueError("Gemini client not initialized for real embeddings. Provide a valid GEMINI_API_KEY.")
-        
-        response = self.client.models.embed_content(
-            model='text-embedding-004',
-            contents=text,
-        )
-        return response.embeddings[0].values
+    def get_embedding(self, text: str, retries: int = 5, backoff_factor: float = 2.0) -> List[float]:
+        for attempt in range(retries):
+            try:
+                payload = {
+                    "model": "nomic-embed-text",
+                    "prompt": text
+                }
+                response = requests.post(self.endpoint, json=payload, timeout=30)
+                response.raise_for_status()
+                data = response.json()
+                return data.get("embedding", [])
+            except Exception as e:
+                if attempt < retries - 1:
+                    sleep_time = backoff_factor ** attempt
+                    print(f"Embedding retry: Rate limit/error hit. Retrying in {sleep_time} seconds (Attempt {attempt+1}/{retries})...")
+                    time.sleep(sleep_time)
+                    continue
+                print(f"Failed to get embedding: {e}")
+                raise e
 
 class QdrantService:
     def __init__(self):
@@ -64,11 +74,11 @@ class QdrantService:
         )
 
     def search_points(self, query_vector: List[float], limit: int = 3):
-        return self.client.search(
+        return self.client.query_points(
             collection_name=self.collection_name,
-            query_vector=query_vector,
+            query=query_vector,
             limit=limit
-        )
+        ).points
 
 class RAGService:
     def __init__(self):
@@ -77,28 +87,25 @@ class RAGService:
         self.qdrant.ensure_collection_exists(vector_size=768)
 
     def _chunk_text(self, text: str, chunk_size: int = 1000, overlap: int = 200) -> List[str]:
-        """Splits raw text into overlapping chunks."""
-        chunks = []
-        start = 0
-        text_len = len(text)
-        while start < text_len:
-            end = start + chunk_size
-            chunks.append(text[start:end])
-            if end >= text_len:
-                break
-            start = end - overlap
-        return chunks
+        """Splits raw text into overlapping chunks using ingestion rules."""
+        return chunk_text(text, chunk_size, overlap)
 
     def extract_metadata(self, text: str) -> Dict[str, str]:
-        if not self.embedder.client:
-            return {"title": "Unknown Document", "service": "unknown", "type": "UNKNOWN"}
         try:
-            prompt = "Analyze the following document and extract metadata. Return a JSON object with 'title', 'service', and 'type'. The 'type' must be one of: RUNBOOK, POST_MORTEM, ARCHITECTURE, PLAYBOOK, WIKI. Document: " + text[:2000]
-            response = self.embedder.client.models.generate_content(
-                model='gemini-1.5-flash',
-                contents=prompt
-            )
-            json_str = re.search(r'\{.*\}', response.text, re.DOTALL)
+            base_url = os.getenv("OLLAMA_BASE_URL", settings.OLLAMA_BASE_URL).rstrip("/")
+            endpoint = f"{base_url}/api/generate"
+            prompt = "Analyze the following document and extract metadata. Return ONLY a JSON object with 'title', 'service', and 'type'. The 'type' must be one of: RUNBOOK, POST_MORTEM, ARCHITECTURE, PLAYBOOK, WIKI. Document: " + text[:2000]
+            
+            payload = {
+                "model": "llama3.2",
+                "prompt": prompt,
+                "stream": False
+            }
+            response = requests.post(endpoint, json=payload, timeout=60)
+            response.raise_for_status()
+            text_resp = response.json().get("response", "")
+            
+            json_str = re.search(r'\{.*\}', text_resp, re.DOTALL)
             if json_str:
                 return json.loads(json_str.group(0))
         except Exception as e:
@@ -129,6 +136,19 @@ class RAGService:
                 content = "\n".join([para.text for para in doc.paragraphs])
             except Exception as e:
                 print(f"Error reading DOCX {file_path}: {e}")
+        elif ext == "ipynb":
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    nb = json.load(f)
+                    for cell in nb.get("cells", []):
+                        if cell.get("cell_type") in ["markdown", "code"]:
+                            src = cell.get("source", [])
+                            if isinstance(src, list):
+                                src = "".join(src)
+                            if src:
+                                content += src + "\n\n"
+            except Exception as e:
+                print(f"Error reading notebook {file_path}: {e}")
         else:
             raise ValueError(f"Unsupported file type: {ext}")
 
@@ -155,8 +175,8 @@ class RAGService:
                 "chunk_index": i,
                 **metadata
             }
-            # Generate deterministic point ID based on doc_id and chunk index
-            point_id = hash(f"{doc_id}_{i}") % (10**8)
+            # Generate deterministic UUID point ID based on doc_id and chunk index
+            point_id = str(uuid.uuid5(uuid.NAMESPACE_OID, f"{doc_id}_{i}"))
             points.append(qmodels.PointStruct(id=point_id, vector=vector, payload=payload))
             
         batch_size = 100
@@ -166,10 +186,24 @@ class RAGService:
                 self.qdrant.upsert_points(batch)
 
     def query_sop_runbooks(self, query: str, limit: int = 3) -> List[Dict[str, Any]]:
-        """Maintains the legacy interface expected by workflows.py."""
+        """Maintains the legacy interface expected by workflows.py but returns full metadata."""
         query_vector = self.embedder.get_embedding(query)
         results = self.qdrant.search_points(query_vector=query_vector, limit=limit)
-        return [{**r.payload, "score": r.score} for r in results]
+        
+        enhanced_results = []
+        for r in results:
+            payload = r.payload or {}
+            enhanced_results.append({
+                "content": payload.get("content", ""),
+                "score": r.score,
+                "title": payload.get("title", "Unknown"),
+                "doc_id": payload.get("doc_id"),
+                "chunk_index": payload.get("chunk_index"),
+                "service": payload.get("service"),
+                "type": payload.get("type"),
+                "incident_id": payload.get("incident_id")
+            })
+        return enhanced_results
 
 # Shared instance maintains identical interface for workflows.py
 try:

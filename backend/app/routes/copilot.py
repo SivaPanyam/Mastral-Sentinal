@@ -14,6 +14,32 @@ from app.mastra.rag import rag_manager
 from app.auth import EnkryptMiddleware, get_current_user
 from app.crud import IncidentRepository, ReportRepository, AgentOutputRepository
 
+class OllamaService:
+    def __init__(self):
+        import os
+        from app.config import settings
+        self.base_url = os.getenv("OLLAMA_BASE_URL", settings.OLLAMA_BASE_URL).rstrip("/")
+        self.endpoint = f"{self.base_url}/api/generate"
+
+    def generate(self, prompt, system_instruction=None):
+        try:
+            full_prompt = prompt if not system_instruction else f"{system_instruction}\n\n{prompt}"
+            payload = {
+                "model": "llama3.2",
+                "prompt": full_prompt,
+                "stream": False
+            }
+            response = requests.post(self.endpoint, json=payload, timeout=60)
+            response.raise_for_status()
+            return {"text": response.json().get("response", "")}
+        except Exception as e:
+            return {"text": f"Error generating text: {str(e)}"}
+            
+    def summarize(self, text):
+        return self.generate(f"Summarize the following report:\n\n{text}")["text"]
+
+ollama_service = OllamaService()
+
 router = APIRouter(prefix="/copilot", tags=["AI Copilot"])
 
 class ChatMessage(BaseModel):
@@ -32,8 +58,8 @@ class ChatResponse(BaseModel):
     guardrailStatus: Dict[str, Any] = {}
 
 def extract_incident_ids(text: str) -> List[str]:
-    """Helper to extract incident IDs matching the INC-XXXX pattern from text."""
-    matches = re.findall(r"\b(INC-2026-\w+|INC-\w+)\b", text, re.IGNORECASE)
+    """Helper to extract incident IDs matching INC-XXXX or INC100000 patterns from text."""
+    matches = re.findall(r"\b(INC-2026-\w+|INC-\w+|INC\d{4,})\b", text, re.IGNORECASE)
     return [m.upper() for m in matches]
 
 @router.post("/chat", response_model=ChatResponse)
@@ -106,7 +132,9 @@ def copilot_chat(req: ChatRequest, db: Session = Depends(get_db), current_user =
 
     if intent == "Operational Q&A":
         lower_query = user_query.lower()
-        if "explain" in lower_query or "diagnose" in lower_query or "what happened" in lower_query:
+        if "list" in lower_query and ("incident" in lower_query or "all" in lower_query):
+            intent = "List Incidents"
+        elif "explain" in lower_query or "diagnose" in lower_query or "what happened" in lower_query:
             intent = "Explain Incident"
         elif "search" in lower_query or "find" in lower_query or "runbook" in lower_query:
             intent = "Search Knowledge"
@@ -121,7 +149,23 @@ def copilot_chat(req: ChatRequest, db: Session = Depends(get_db), current_user =
     copilot_response = ""
     retrieved_docs = []
 
-    if intent == "Explain Incident":
+    if intent == "List Incidents":
+        incidents = IncidentRepository.get_all(db)
+        if not incidents:
+            copilot_response = "No incidents found in the database."
+        else:
+            copilot_response = f"### 📋 Incident Inventory ({len(incidents)} total)\n\n"
+            copilot_response += "| # | Incident ID | Title | Service | Severity | Status |\n"
+            copilot_response += "|---|-------------|-------|---------|----------|--------|\n"
+            for idx, inc in enumerate(incidents[:50], 1):
+                copilot_response += (
+                    f"| {idx} | `{inc.incident_number}` | {inc.title} | "
+                    f"`{inc.service}` | {inc.severity} | {inc.status} |\n"
+                )
+            if len(incidents) > 50:
+                copilot_response += f"\n*Showing first 50 of {len(incidents)} incidents.*\n"
+
+    elif intent == "Explain Incident":
         if not primary_id:
             copilot_response = "Please provide the incident ID you would like me to explain (e.g., INC-2026-XXXX)."
         else:
@@ -141,16 +185,6 @@ def copilot_chat(req: ChatRequest, db: Session = Depends(get_db), current_user =
                     f"```\n"
                     f"*Mastra AI diagnostic reasoning is now handled asynchronously. Please use the 'Trigger Workflow' command to run the pipeline.*"
                 )
-                    copilot_response = (
-                        f"### 🔍 Diagnostics for `{incident.id}` (Static Fallback)\n\n"
-                        f"**Service**: `{incident.service}`\n"
-                        f"**Severity**: `{incident.severity}`\n"
-                        f"**Recent Logs ({len(incident.logs)} entries)**:\n"
-                        f"```\n"
-                        f"{logs_summary[:400]}...\n"
-                        f"```\n"
-                        f"*Provide a valid `GEMINI_API_KEY` to enable AI diagnostic reasoning.*"
-                    )
 
     elif intent == "Search Knowledge":
         retrieved_docs = rag_manager.query_sop_runbooks(query=user_query, limit=3)
@@ -191,8 +225,8 @@ def copilot_chat(req: ChatRequest, db: Session = Depends(get_db), current_user =
                     f"- Status: {inc2.status}\n"
                     f"- Severity: {inc2.severity}\n"
                 )
-                if gemini_service and gemini_service.client:
-                    res = gemini_service.generate(prompt=prompt, system_instruction="You are an expert SRE comparing outages. Highlight similarities and anomalies.")
+                if ollama_service:
+                    res = ollama_service.generate(prompt=prompt, system_instruction="You are an expert SRE comparing outages. Highlight similarities and anomalies.")
                     copilot_response = res.get("text", "")
                 else:
                     copilot_response = (
@@ -217,8 +251,8 @@ def copilot_chat(req: ChatRequest, db: Session = Depends(get_db), current_user =
                     f"Impact: {report.impact}\n"
                 )
                 copilot_response = f"### 📝 RCA Post-Mortem Summary for `{primary_id}`\n\n"
-                if gemini_service and gemini_service.client:
-                    copilot_response += gemini_service.summarize(report_content)
+                if ollama_service:
+                    copilot_response += ollama_service.summarize(report_content)
                 else:
                     copilot_response += (
                         f"**RCA Summary**: {report.summary}\n\n"
@@ -268,8 +302,8 @@ def copilot_chat(req: ChatRequest, db: Session = Depends(get_db), current_user =
             f"Grounding context:\n{context}\n\n"
             f"User Question: {user_query}\n"
         )
-        if gemini_service and gemini_service.client:
-            res = gemini_service.generate(prompt=prompt, system_instruction="Provide a technical, elegant markdown answer grounded on context.")
+        if ollama_service:
+            res = ollama_service.generate(prompt=prompt, system_instruction="Provide a technical, elegant markdown answer grounded on context.")
             copilot_response = res.get("text", "")
         else:
             if retrieved_docs:

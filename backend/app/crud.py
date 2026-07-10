@@ -44,7 +44,12 @@ class IncidentRepository:
 
     @staticmethod
     def get_by_id(db: Session, incident_id: str) -> Optional[Incident]:
-        return db.query(Incident).filter(Incident.id == incident_id).first()
+        import uuid
+        try:
+            uuid.UUID(incident_id)
+            return db.query(Incident).filter(Incident.id == incident_id).first()
+        except ValueError:
+            return db.query(Incident).filter(Incident.incident_number == incident_id).first()
 
     @staticmethod
     def create(db: Session, incident: Incident) -> Incident:

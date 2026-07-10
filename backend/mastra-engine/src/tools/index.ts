@@ -1,8 +1,9 @@
-import { createTool } from '@mastra/core';
+import { createTool } from '../mastra';
 import { z } from 'zod';
 import axios from 'axios';
 import * as dotenv from 'dotenv';
 import path from 'path';
+import { GoogleGenAI } from '@google/genai';
 
 // Load environment variables from backend
 dotenv.config({ path: path.resolve(__dirname, '../../../.env') });
@@ -105,22 +106,158 @@ export const guardrailTool = createTool({
 
 export const embeddingTool = createTool({
   id: 'embeddingTool',
-  description: 'Generates embeddings for a given text.',
+  description: 'Generates embeddings for a given text or list of texts.',
   inputSchema: z.object({
-    text: z.string().describe('Text to embed.')
+    text: z.union([z.string(), z.array(z.string())]).describe('Text or list of texts to embed.')
   }),
   execute: async ({ context }) => {
-    return { embeddings: [0.1, 0.2, 0.3], mock: true };
+    try {
+      const client = getGeminiClient();
+      const texts = Array.isArray(context.text) ? context.text : [context.text];
+      
+      const MAX_RETRIES = 5;
+      const results: any[] = [];
+      const chunkSize = 10; // Batch requests concurrency
+      
+      for (let i = 0; i < texts.length; i += chunkSize) {
+        const batch = texts.slice(i, i + chunkSize);
+        
+        const batchPromises = batch.map(async (text) => {
+          let attempt = 0;
+          let lastError = null;
+          
+          while (attempt < MAX_RETRIES) {
+            try {
+              attempt++;
+              const response: any = await client.models.embedContent({
+                model: 'text-embedding-004',
+                contents: text,
+              });
+              
+              const embedding = response.embeddings?.[0]?.values || response.embedding?.values || response.embeddings?.[0];
+              if (!embedding) {
+                 throw new Error("No embedding values returned from API");
+              }
+              // Extract the array of floats safely
+              return Array.isArray(embedding) ? embedding : embedding.values || embedding;
+            } catch (err: any) {
+              lastError = err;
+              const isRateLimit = err.status === 429 || err.message?.includes('429') || err.message?.includes('quota');
+              
+              if (isRateLimit) {
+                // Rate limit - exponential backoff starting at 2s
+                await new Promise(res => setTimeout(res, 2000 * Math.pow(2, attempt)));
+              } else if (attempt >= MAX_RETRIES) {
+                break;
+              } else {
+                // Other transient error - exponential backoff starting at 1s
+                await new Promise(res => setTimeout(res, 1000 * Math.pow(2, attempt)));
+              }
+            }
+          }
+          throw new Error(`Embedding failed for chunk after ${MAX_RETRIES} attempts: ${lastError?.message}`);
+        });
+
+        const batchResults = await Promise.all(batchPromises);
+        results.push(...batchResults);
+      }
+
+      return { embeddings: Array.isArray(context.text) ? results : results[0] };
+
+    } catch (error: any) {
+      console.error("[Embedding Tool Error]:", error.message);
+      return { error: 'Failed to generate embeddings', details: error.message };
+    }
   }
 });
 
+// Initialize the Gemini client lazily
+let geminiClient: GoogleGenAI | null = null;
+function getGeminiClient() {
+  if (!geminiClient) {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      throw new Error("GEMINI_API_KEY environment variable is missing.");
+    }
+    geminiClient = new GoogleGenAI({ apiKey });
+  }
+  return geminiClient;
+}
+
 export const geminiTool = createTool({
   id: 'geminiTool',
-  description: 'Uses Gemini API to perform raw generation tasks.',
+  description: 'Uses Gemini API to perform reasoning and generation tasks.',
   inputSchema: z.object({
-    prompt: z.string().describe('Prompt for Gemini.')
+    systemPrompt: z.string().describe('System instructions for the model.'),
+    userPrompt: z.string().describe('The primary user prompt or query.'),
+    context: z.string().optional().describe('Optional contextual information (e.g., logs, RAG results).'),
+    history: z.array(z.object({
+      role: z.string(),
+      parts: z.array(z.object({ text: z.string() }))
+    })).optional().describe('Optional conversation history.')
   }),
   execute: async ({ context }) => {
-    return { response: "Generated response from Gemini Tool." };
+    try {
+      const client = getGeminiClient();
+      const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+      
+      let fullPrompt = context.userPrompt;
+      if (context.context) {
+        fullPrompt = `Context:\n${context.context}\n\nTask:\n${context.userPrompt}`;
+      }
+
+      const contents: any[] = [];
+      if (context.history && context.history.length > 0) {
+        contents.push(...context.history);
+      }
+      contents.push({ role: 'user', parts: [{ text: fullPrompt }] });
+
+      const generateConfig: any = {};
+      if (context.systemPrompt) {
+        generateConfig.systemInstruction = context.systemPrompt;
+      }
+
+      // Retry logic with timeout
+      const MAX_RETRIES = 3;
+      let attempt = 0;
+      let lastError: Error | null = null;
+
+      while (attempt < MAX_RETRIES) {
+        try {
+          attempt++;
+          
+          const timeoutMs = 30000;
+          const timeoutPromise = new Promise((_, reject) => 
+            setTimeout(() => reject(new Error("Gemini API request timed out")), timeoutMs)
+          );
+
+          const response: any = await Promise.race([
+            client.models.generateContent({
+              model,
+              contents,
+              config: generateConfig
+            }),
+            timeoutPromise
+          ]);
+
+          return { response: response.text };
+
+        } catch (error: any) {
+          lastError = error;
+          console.error(`[Gemini Tool Error] Attempt ${attempt}/${MAX_RETRIES} failed:`, error.message);
+          if (attempt >= MAX_RETRIES) {
+            break;
+          }
+          // Exponential backoff
+          await new Promise(res => setTimeout(res, 1000 * Math.pow(2, attempt)));
+        }
+      }
+      
+      return { error: 'Failed to generate response from Gemini API', details: lastError?.message };
+
+    } catch (error: any) {
+      console.error("[Gemini Tool Init Error]:", error.message);
+      return { error: 'Failed to initialize Gemini Tool', details: error.message };
+    }
   }
 });
