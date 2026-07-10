@@ -4,3 +4,9 @@ node_modules
 dist
 build
 .env
+backend
+prometheus
+grafana
+.pytest_cache
+__pycache__
+*.pyc

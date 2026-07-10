@@ -42,11 +42,11 @@ from app.logger import setup_structlog, logger
 
 setup_structlog()
 
-# Create tables automatically on startup
-Base.metadata.create_all(bind=engine)
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Create tables automatically on startup
+    Base.metadata.create_all(bind=engine)
+    
     # Instrument SQLAlchemy here after engine is initialized
     SQLAlchemyInstrumentor().instrument(
         engine=engine,
