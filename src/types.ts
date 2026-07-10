@@ -126,6 +126,7 @@ export interface KnowledgeDocument {
   tags: string[];
   lastUpdated: string;
   vectorsCount?: number;
+  status?: string;
 }
 
 export interface ServiceHealth {

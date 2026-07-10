@@ -261,3 +261,32 @@ export const geminiTool = createTool({
     }
   }
 });
+
+export const indexKnowledgeTool = createTool({
+  id: 'indexKnowledgeTool',
+  description: 'Indexes a lessons learned document into the vector database.',
+  inputSchema: z.object({
+    docId: z.string().describe('A unique ID for the document.'),
+    title: z.string().describe('The title of the knowledge document.'),
+    content: z.string().describe('The content or lessons learned to index.'),
+    service: z.string().describe('The service this relates to.')
+  }),
+  execute: async ({ context }) => {
+    try {
+      const response = await axios.post(`${FASTAPI_URL}/knowledge/documents`, {
+        doc_id: context.docId,
+        title: context.title,
+        content: context.content,
+        metadata: {
+          type: 'POST_MORTEM',
+          service: context.service,
+          author: 'knowledge-agent'
+        }
+      });
+      return response.data;
+    } catch (error: any) {
+      console.error("Index Knowledge error:", error.message);
+      return { error: 'Failed to index knowledge' };
+    }
+  }
+});

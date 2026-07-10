@@ -198,6 +198,44 @@ export const Settings: React.FC = () => {
 
           </div>
 
+          {/* Section D: Audit Logs */}
+          <div className="p-5 bg-slate-900 border border-slate-800 rounded-xl space-y-4 lg:col-span-2">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <div className="flex items-center gap-2">
+                <Eye className="w-4 h-4 text-emerald-400" />
+                <h4 className="font-sans font-bold text-slate-200 text-xs uppercase tracking-wider">Security Audit Logs</h4>
+              </div>
+            </div>
+
+            <div className="overflow-x-auto">
+              <table className="w-full text-left font-mono text-[10px] text-slate-400">
+                <thead className="bg-slate-950/40 text-slate-500 uppercase">
+                  <tr>
+                    <th className="p-2 border-b border-slate-800">Timestamp</th>
+                    <th className="p-2 border-b border-slate-800">User</th>
+                    <th className="p-2 border-b border-slate-800">Action</th>
+                    <th className="p-2 border-b border-slate-800">Details</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {useApp().auditLogs?.map(log => (
+                    <tr key={log.id} className="border-b border-slate-800/50 hover:bg-slate-800/20">
+                      <td className="p-2">{new Date(log.timestamp).toLocaleString()}</td>
+                      <td className="p-2">{log.userName}</td>
+                      <td className="p-2 font-bold text-blue-400">{log.action}</td>
+                      <td className="p-2">{log.details}</td>
+                    </tr>
+                  ))}
+                  {(!useApp().auditLogs || useApp().auditLogs.length === 0) && (
+                    <tr>
+                      <td colSpan={4} className="p-4 text-center text-slate-600 italic">No audit logs found.</td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
         </div>
 
         {/* Submit Save Button */}

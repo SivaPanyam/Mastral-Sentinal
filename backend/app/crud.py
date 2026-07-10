@@ -1,6 +1,7 @@
 from sqlalchemy.orm import Session
-from app.models import User, Incident, IncidentLog, AgentOutput, Report, KnowledgeSource, AuditLog, Settings
+from app.models import User, Incident, IncidentLog, AgentOutput, Report, KnowledgeSource, AuditLog, Settings, LogEntry
 from typing import List, Optional
+from app.ws import broadcast_sync
 
 class UserRepository:
     @staticmethod
@@ -56,13 +57,99 @@ class IncidentRepository:
         db.add(incident)
         db.commit()
         db.refresh(incident)
+        broadcast_sync("INCIDENT_CREATED", {
+            "id": incident.id,
+            "title": incident.title,
+            "service": incident.service,
+            "severity": incident.severity,
+            "status": incident.status
+        })
         return incident
+
+    @staticmethod
+    def create_or_update_incident(db: Session, incident_data: dict, log_record: IncidentLog) -> Incident:
+        import uuid
+        active_statuses = ["TRIGGERED", "TRIAGED", "DIAGNOSING", "INVESTIGATING", "MITIGATED"]
+        
+        # We try to find an existing active incident for this rule/service
+        service_name = incident_data.get("service")
+        # To avoid duplicate for same rule, we can store rule_id in tags or just use service and status.
+        # Here we just use service and status to match previous heuristic.
+        existing_incident = db.query(Incident).filter(
+            Incident.service == service_name,
+            Incident.status.in_(active_statuses)
+        ).first()
+
+        if existing_incident:
+            # Append log to existing incident
+            log_record.incidentId = existing_incident.id
+            db.add(log_record)
+            
+            # Maybe bump severity if new log is CRITICAL and incident is HIGH
+            if incident_data.get("severity") in ["CRITICAL", "FATAL"] and existing_incident.severity in ["MEDIUM", "LOW", "HIGH"]:
+                existing_incident.severity = "CRITICAL"
+                
+            db.commit()
+            db.refresh(existing_incident)
+            db.refresh(log_record)
+            broadcast_sync("INCIDENT_UPDATED", {
+                "id": existing_incident.id,
+                "title": existing_incident.title,
+                "service": existing_incident.service,
+                "severity": existing_incident.severity,
+                "status": existing_incident.status
+            })
+            return existing_incident
+        else:
+            # Create new
+            new_id = f"INC-2026-{uuid.uuid4().hex[:4].upper()}"
+            
+            rule_name = incident_data.get("rule_name", "Unknown Rule")
+            affected_components = incident_data.get("affected_components", [])
+            if not affected_components and service_name:
+                affected_components = [service_name]
+                
+            new_incident = Incident(
+                id=new_id,
+                incident_number=f"INC{uuid.uuid4().hex[:6].upper()}",
+                title=incident_data.get("title", f"Automated Detection: {service_name}"),
+                description=incident_data.get("description", ""),
+                service=service_name,
+                severity=incident_data.get("severity", "MEDIUM"),
+                status="TRIGGERED",
+                source="DETECTION_ENGINE",
+                affected_services=affected_components,
+                tags={"rule_triggered": rule_name}
+            )
+            db.add(new_incident)
+            db.commit()
+            db.refresh(new_incident)
+            
+            log_record.incidentId = new_incident.id
+            db.add(log_record)
+            db.commit()
+            db.refresh(log_record)
+            broadcast_sync("INCIDENT_CREATED", {
+                "id": new_incident.id,
+                "title": new_incident.title,
+                "service": new_incident.service,
+                "severity": new_incident.severity,
+                "status": new_incident.status
+            })
+            return new_incident
 
     @staticmethod
     def update(db: Session, incident: Incident) -> Incident:
         db.add(incident)
         db.commit()
         db.refresh(incident)
+        broadcast_sync("INCIDENT_UPDATED", {
+            "id": incident.id,
+            "title": incident.title,
+            "service": incident.service,
+            "severity": incident.severity,
+            "status": incident.status
+        })
         return incident
 
     @staticmethod
@@ -87,6 +174,11 @@ class ReportRepository:
         db.add(report)
         db.commit()
         db.refresh(report)
+        broadcast_sync("REPORT_GENERATED", {
+            "id": report.id,
+            "incidentId": report.incidentId,
+            "title": report.title
+        })
         return report
 
     @staticmethod
@@ -136,6 +228,10 @@ class KnowledgeSourceRepository:
         db.add(source)
         db.commit()
         db.refresh(source)
+        broadcast_sync("KNOWLEDGE_UPDATED", {
+            "id": source.id,
+            "title": source.title
+        })
         return source
 
     @staticmethod
@@ -196,3 +292,12 @@ class SettingsRepository:
         db.commit()
         db.refresh(settings)
         return settings
+
+class LogEntryRepository:
+    @staticmethod
+    def create(db: Session, log_entry: LogEntry) -> LogEntry:
+        db.add(log_entry)
+        db.commit()
+        db.refresh(log_entry)
+        return log_entry
+

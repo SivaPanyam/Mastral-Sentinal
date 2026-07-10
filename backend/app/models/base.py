@@ -46,4 +46,7 @@ class AuditMixin:
     createdBy = Column("created_by", String, nullable=True)
     updatedBy = Column("updated_by", String, nullable=True)
     version   = Column("version", Integer, default=1, nullable=False)
+    
+    tenant_id = Column("tenant_id", String, nullable=True, index=True)
+    environment_id = Column("environment_id", String, nullable=True, index=True)
 

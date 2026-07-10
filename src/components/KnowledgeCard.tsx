@@ -38,6 +38,13 @@ export const KnowledgeCard: React.FC<KnowledgeCardProps> = ({ doc }) => {
             <span className={`text-[10px] font-mono font-bold px-2 py-0.5 rounded-full border uppercase ${getDocTypeColor(doc.type)}`}>
               {doc.type}
             </span>
+            {doc.status === 'QUARANTINED' && (
+              <>
+                <span className="text-[10px] font-mono font-bold px-2 py-0.5 rounded-full border uppercase bg-rose-500/10 text-rose-400 border-rose-500/20 flex items-center gap-1">
+                  QUARANTINED
+                </span>
+              </>
+            )}
             <span className="text-slate-700 font-sans text-xs">•</span>
             <span className="text-[10.5px] font-mono font-semibold text-slate-400">
               {doc.service}

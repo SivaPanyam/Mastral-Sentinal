@@ -18,10 +18,17 @@ forward-reference relationships are imported last.
 # 1. Shared declarative base and audit mixin
 from .base import Base, AuditMixin                          # noqa: F401
 
+# 1.5 Multi-tenant models
+from .tenant import Tenant, Environment                     # noqa: F401
+
 # 2. Models with no foreign-key dependencies
 from .user        import User                               # noqa: F401
 from .audit_log   import AuditLog                          # noqa: F401
 from .metric      import Metric                            # noqa: F401
+from .log_entry   import LogEntry                          # noqa: F401
+
+# 2.5 Auth and Identity models
+from .auth_models import ApiKey, UserSession, UserIdentity  # noqa: F401
 
 # 3. Core domain model (declares the M:N association table)
 from .incident        import Incident, incident_knowledge_association   # noqa: F401
@@ -38,8 +45,14 @@ from .settings        import Settings                      # noqa: F401
 __all__ = [
     "Base",
     "AuditMixin",
+    "Tenant",
+    "Environment",
     "User",
     "AuditLog",
+    "LogEntry",
+    "ApiKey",
+    "UserSession",
+    "UserIdentity",
     "Incident",
     "incident_knowledge_association",
     "IncidentLog",

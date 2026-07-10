@@ -18,14 +18,20 @@ class Settings(BaseSettings):
     QDRANT_PORT: int = 6333
     QDRANT_API_KEY: str = ""
     QDRANT_COLLECTION: str = "sentinel_kb"
+    EMBEDDING_PROVIDER: str = "ollama"  # ollama or google
     
     # Database
     POSTGRES_SERVER: str = "localhost"
     POSTGRES_USER: str = "mastra_user"
-    POSTGRES_PASSWORD: str = "MadMax@192!"
+    POSTGRES_PASSWORD: str = ""
     POSTGRES_DB: str = "mastra_sentinel"
     POSTGRES_PORT: str = "5432"
     DATABASE_URL: str = ""
+    
+    # Event Pipeline
+    MASTRA_ENGINE_URL: str = "http://localhost:3000/api/workflows/incident-response"
+    PIPELINE_MAX_RETRIES: int = 3
+    PIPELINE_RETRY_DELAY_SECONDS: int = 5
 
     class Config:
         env_file = ".env"

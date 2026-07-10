@@ -5,6 +5,8 @@ import { knowledgeService } from '../services/knowledgeService';
 import { analyticsService } from '../services/analyticsService';
 import { agentService } from '../services/agentService';
 import { reportService } from '../services/reportService';
+import { wsService } from '../services/wsService';
+import { auditLogService } from '../services/auditLogService';
 
 interface AppContextType {
   currentView: 'dashboard' | 'incidents' | 'knowledge' | 'reports' | 'analytics' | 'settings' | 'copilot';
@@ -23,6 +25,7 @@ interface AppContextType {
   };
   knowledgeDocs: KnowledgeDocument[];
   reports: Report[];
+  auditLogs: any[];
   
   isLoading: boolean;
   refreshData: () => Promise<void>;
@@ -67,6 +70,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   });
   const [knowledgeDocs, setKnowledgeDocs] = useState<KnowledgeDocument[]>([]);
   const [reports, setReports] = useState<Report[]>([]);
+  const [auditLogs, setAuditLogs] = useState<any[]>([]);
   const [agentRuns, setAgentRuns] = useState<Record<string, AgentOutput[]>>({});
   
   const [isLoading, setIsLoading] = useState(true);
@@ -86,13 +90,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const loadData = async () => {
     try {
       setIsLoading(true);
-      const [incList, healthList, historyList, overview, kbList, reportList] = await Promise.all([
+      const [incList, healthList, historyList, overview, kbList, reportList, auditList] = await Promise.all([
         incidentService.getIncidents(),
         analyticsService.getServiceHealth(),
         analyticsService.getMetricHistory(),
         analyticsService.getSystemStatusOverview(),
         knowledgeService.getDocuments(),
         reportService.getReports(),
+        auditLogService.getAuditLogs(),
       ]);
 
       setIncidents(incList);
@@ -101,6 +106,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setSystemOverview(overview);
       setKnowledgeDocs(kbList);
       setReports(reportList);
+      setAuditLogs(auditList);
 
       // Preload agent runs for default incidents
       const initialRuns: Record<string, AgentOutput[]> = {};
@@ -118,6 +124,73 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   useEffect(() => {
     loadData();
+    
+    // Initialize WebSockets for real-time events
+    wsService.connect();
+    
+    const unsubIncident = wsService.subscribe('INCIDENT_CREATED', (payload) => {
+      console.log('WS Event: INCIDENT_CREATED', payload);
+      addNotification(`New incident detected: ${payload.id} (${payload.title})`, 'warn');
+      incidentService.getIncidents().then(incList => setIncidents(incList));
+    });
+    
+    const unsubIncidentUpdated = wsService.subscribe('INCIDENT_UPDATED', (payload) => {
+      console.log('WS Event: INCIDENT_UPDATED', payload);
+      incidentService.getIncidents().then(incList => setIncidents(incList));
+    });
+
+    const unsubLog = wsService.subscribe('LOG_APPENDED', (payload) => {
+      console.log('WS Event: LOG_APPENDED', payload);
+      addNotification(`New log appended to ${payload.incident_id}`, 'info');
+    });
+
+    const unsubAgentStarted = wsService.subscribe('AGENT_STARTED', (payload) => {
+      console.log('WS Event: AGENT_STARTED', payload);
+      addNotification(`Mastra Agent ${payload.step} started running...`, 'info');
+      setIsRunningAgent(true);
+    });
+
+    const unsubAgentFinished = wsService.subscribe('AGENT_FINISHED', (payload) => {
+      console.log('WS Event: AGENT_FINISHED', payload);
+      addNotification(`Mastra ${payload.agentType} agent finished successfully.`, 'success');
+      agentService.getAgentRunsForIncident(payload.incidentId).then(updatedRuns => {
+          setAgentRuns(prev => ({
+            ...prev,
+            [payload.incidentId]: updatedRuns
+          }));
+      });
+      // Incident status is updated by backend, the INCIDENT_UPDATED event will refresh the incidents list.
+      setIsRunningAgent(false);
+    });
+
+    const unsubReportGenerated = wsService.subscribe('REPORT_GENERATED', (payload) => {
+      console.log('WS Event: REPORT_GENERATED', payload);
+      addNotification(`RCA Report generated for ${payload.incidentId}`, 'success');
+      reportService.getReports().then(updatedReports => setReports(updatedReports));
+    });
+
+    const unsubKnowledgeUpdated = wsService.subscribe('KNOWLEDGE_UPDATED', (payload) => {
+      console.log('WS Event: KNOWLEDGE_UPDATED', payload);
+      addNotification(`Knowledge Base updated: ${payload.title}`, 'info');
+      knowledgeService.getDocuments().then(docs => setKnowledgeDocs(docs));
+    });
+
+    const unsubMetricsUpdated = wsService.subscribe('METRICS_UPDATED', () => {
+      console.log('WS Event: METRICS_UPDATED');
+      analyticsService.getSystemStatusOverview().then(overview => setSystemOverview(overview));
+      analyticsService.getMetricHistory().then(history => setMetricHistory(history));
+    });
+
+    return () => {
+      unsubIncident();
+      unsubIncidentUpdated();
+      unsubLog();
+      unsubAgentStarted();
+      unsubAgentFinished();
+      unsubReportGenerated();
+      unsubKnowledgeUpdated();
+      unsubMetricsUpdated();
+    };
   }, []);
 
   const setView = (view: 'dashboard' | 'incidents' | 'knowledge' | 'reports' | 'analytics' | 'settings' | 'copilot', incidentId: string | null = null) => {
@@ -185,103 +258,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setIsRunningAgent(true);
       addNotification(`Launching Mastra ${agentType} agent for ${incidentId}...`, 'info');
       
-      const newOutput = await agentService.triggerPipelineStep(incidentId, agentType);
+      // Trigger the pipeline synchronously (it starts the background task in backend)
+      await agentService.triggerPipelineStep(incidentId, agentType);
       
-      if (agentType === AgentType.TRIAGE) {
-        // SSE connection to receive live agent updates
-        const eventSource = new EventSource(`/api/v1/incidents/${incidentId}/stream`);
-        
-        eventSource.onmessage = async (event) => {
-          try {
-            const data = JSON.parse(event.data);
-            
-            if (data.event === "step_started") {
-              addNotification(`Mastra Agent ${data.step} started running...`, 'info');
-            } else if (data.event === "step_completed") {
-              addNotification(`Mastra Agent ${data.step} finished successfully.`, 'info');
-              
-              // Pull all updated runs from database to get the real outputs
-              const updatedRuns = await agentService.getAgentRunsForIncident(incidentId);
-              setAgentRuns(prev => ({
-                ...prev,
-                [incidentId]: updatedRuns
-              }));
-              
-              // Auto advance state machine based on completed agent runs
-              if (data.step === "TRIAGE") {
-                await updateIncidentStatus(incidentId, IncidentStatus.TRIAGED);
-              } else if (data.step === "DIAGNOSIS") {
-                await updateIncidentStatus(incidentId, IncidentStatus.DIAGNOSING);
-              } else if (data.step === "RECOMMENDATION") {
-                await updateIncidentStatus(incidentId, IncidentStatus.INVESTIGATING);
-              } else if (data.step === "REPORT") {
-                await updateIncidentStatus(incidentId, IncidentStatus.RESOLVED);
-                // Reload reports
-                const updatedReports = await reportService.getReports();
-                setReports(updatedReports);
-              }
-            } else if (data.event === "pipeline_completed") {
-              eventSource.close();
-              setIsRunningAgent(false);
-              addNotification("Mastra SRE response pipeline completed successfully!", "success");
-              // Refresh incident status
-              const updatedIncidents = await incidentService.getIncidents();
-              setIncidents(updatedIncidents);
-            } else if (data.event === "pipeline_failed") {
-              eventSource.close();
-              setIsRunningAgent(false);
-              addNotification(`Mastra SRE pipeline failed: ${data.error || 'Unknown error'}`, "error");
-            }
-          } catch (e) {
-            console.error("Error processing SSE message:", e);
-          }
-        };
-        
-        eventSource.onerror = (e) => {
-          console.error("SSE stream error:", e);
-          eventSource.close();
-          setIsRunningAgent(false);
-        };
-      } else {
-        // Fallback or subsequent step DB pull
-        const updatedRuns = await agentService.getAgentRunsForIncident(incidentId);
-        
-        setAgentRuns(prev => {
-          const current = prev[incidentId] || [];
-          const merged = [...current];
-          
-          for (const run of updatedRuns) {
-            const index = merged.findIndex(m => m.agentType === run.agentType);
-            if (index !== -1) {
-              merged[index] = run;
-            } else {
-              merged.push(run);
-            }
-          }
-          
-          if (!merged.some(m => m.agentType === newOutput.agentType)) {
-            merged.push(newOutput);
-          }
-          
-          return {
-            ...prev,
-            [incidentId]: merged
-          };
-        });
-
-        if (agentType === AgentType.DIAGNOSIS) {
-          await updateIncidentStatus(incidentId, IncidentStatus.DIAGNOSING);
-        } else if (agentType === AgentType.RECOMMENDATION) {
-          await updateIncidentStatus(incidentId, IncidentStatus.INVESTIGATING);
-        } else if (agentType === AgentType.REPORT) {
-          await updateIncidentStatus(incidentId, IncidentStatus.RESOLVED);
-          const updatedReports = await reportService.getReports();
-          setReports(updatedReports);
-        }
-        
-        addNotification(`Mastra ${agentType} agent finished successfully.`, 'info');
-        setIsRunningAgent(false);
-      }
+      // We no longer manually manage SSE or state here!
+      // The backend Mastra engine will process it asynchronously, 
+      // push webhooks to FastAPI, which broadcasts WebSockets to ALL clients.
+      // The wsService.subscribe hooks will catch AGENT_STARTED, AGENT_FINISHED
+      // and update the global state naturally!
+      
     } catch (err) {
       console.error(err);
       addNotification(`Mastra ${agentType} agent failed execution.`, 'error');
@@ -330,6 +315,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         systemOverview,
         knowledgeDocs,
         reports,
+        auditLogs,
         isLoading,
         refreshData: loadData,
         createNewIncident,

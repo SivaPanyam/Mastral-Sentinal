@@ -9,6 +9,7 @@ from app.schemas import IncidentCreate, IncidentOut, IncidentLogCreate, Incident
 from app.auth import require_role, EnkryptMiddleware
 from app.mastra.workflows import incident_sse_manager
 from app.crud import IncidentRepository, AgentOutputRepository, ReportRepository
+from app.ws import broadcast_sync
 import datetime
 import uuid
 import asyncio
@@ -30,10 +31,16 @@ class MastraWebhookPayload(BaseModel):
     error: Optional[str] = None
 
 @router.post("/{incident_id}/mastra-webhook")
-def receive_mastra_webhook(incident_id: str, payload: MastraWebhookPayload, db: Session = Depends(get_db)):
+def receive_mastra_webhook(incident_id: str, payload: MastraWebhookPayload, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     """Receives SSE events from the TS Mastra engine and records them."""
     incident_sse_manager.publish(incident_id, payload.model_dump())
     
+    if payload.event == "step_started":
+        broadcast_sync("AGENT_STARTED", {
+            "incidentId": incident_id,
+            "step": payload.step
+        })
+        
     if payload.event == "step_completed" and payload.data:
         run_id = f"run-{uuid.uuid4().hex[:6]}"
         
@@ -61,36 +68,79 @@ def receive_mastra_webhook(incident_id: str, payload: MastraWebhookPayload, db: 
         )
         AgentOutputRepository.create(db, agent_output)
         
+        # Audit Logging for Agent Execution
+        from app.models.audit_log import AuditLog
+        agent_audit = AuditLog(
+            userId=None,
+            action="AGENT_EXECUTED",
+            resourceType="Mastra Agent",
+            resourceId=run_id,
+            details={"agentType": agent_type, "status": payload.status or "COMPLETED", "actor": "system_workflow"},
+            response_status="SUCCESS"
+        )
+        db.add(agent_audit)
+        db.commit()
+        
+        broadcast_sync("AGENT_FINISHED", {
+            "incidentId": incident_id,
+            "agentType": agent_type,
+            "status": payload.status or "COMPLETED",
+            "run_id": run_id
+        })
+        
     elif payload.event == "pipeline_completed":
         incident = IncidentRepository.get_by_id(db, incident_id)
         if incident:
+            old_status = incident.status
             incident.status = "RESOLVED"
             incident.resolvedAt = datetime.datetime.utcnow()
             incident.leadTimeSeconds = 840
             IncidentRepository.update(db, incident)
             
+            if old_status != "RESOLVED":
+                background_tasks.add_task(dispatch_lessons_learned, incident_id)
+            
+            broadcast_sync("METRICS_UPDATED", {})
+            
     return {"status": "ok"}
 
 
-@router.get("/", response_model=List[IncidentOut])
-def get_incidents(db: Session = Depends(get_db)):
-    """Retrieve all logged system incidents."""
-    return IncidentRepository.get_all(db)
+from fastapi_pagination import Page, paginate
+from fastapi_cache.decorator import cache
 
+@router.get("/", response_model=Page[IncidentOut])
+@cache(expire=30)
+def get_incidents(db: Session = Depends(get_db)):
+    """Retrieve all logged system incidents with pagination and caching."""
+    incidents = IncidentRepository.get_all(db)
+    return paginate(incidents)
+
+
+from app.telemetry import INCIDENT_DETECTED_COUNTER
 
 @router.post("/", response_model=IncidentOut, status_code=status.HTTP_201_CREATED)
 def create_incident(incident_in: IncidentCreate, db: Session = Depends(get_db), current_user = Depends(require_role(["Admin", "SRE", "DevOps"]))):
     """Log a new system anomaly or automated monitor warning."""
     new_id = f"INC-2026-{uuid.uuid4().hex[:4].upper()}"
+    scan_result = EnkryptMiddleware.scan_document(incident_in.description, current_user, db)
+    
     new_incident = Incident(
         id=new_id,
         title=incident_in.title,
-        description=incident_in.description,
+        description=scan_result.get("sanitized_text", incident_in.description),
         service=incident_in.service,
         severity=incident_in.severity,
-        status="TRIGGERED"
+        status="QUARANTINED" if scan_result.get("status") == "QUARANTINED" else "TRIGGERED"
     )
-    return IncidentRepository.create(db, new_incident)
+    created = IncidentRepository.create(db, new_incident)
+    
+    # Telemetry
+    INCIDENT_DETECTED_COUNTER.labels(
+        severity=created.severity,
+        rule="manual_upload"
+    ).inc()
+    
+    return created
 
 
 @router.get("/{incident_id}", response_model=IncidentOut)
@@ -102,15 +152,39 @@ def get_incident(incident_id: str, db: Session = Depends(get_db), current_user =
     return incident
 
 
+import asyncio
+
+def dispatch_lessons_learned(incident_id: str):
+    """Bridge to enqueue async ARQ task from synchronous endpoints."""
+    async def _enqueue():
+        from app.worker import get_arq_pool
+        pool = await get_arq_pool()
+        await pool.enqueue_job('_generate_lessons_learned_task', incident_id)
+        await pool.close()
+    
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.create_task(_enqueue())
+        else:
+            asyncio.run(_enqueue())
+    except Exception as e:
+        print(f"Failed to dispatch ARQ task: {e}")
+
 @router.patch("/{incident_id}", response_model=IncidentOut)
-def update_incident(incident_id: str, updates: Dict[str, Any], db: Session = Depends(get_db), current_user = Depends(require_role(["Admin", "SRE", "DevOps"]))):
+def update_incident(incident_id: str, updates: Dict[str, Any], background_tasks: BackgroundTasks, db: Session = Depends(get_db), current_user = Depends(require_role(["Admin", "SRE", "DevOps"]))):
     """Update details of an incident (such as manual status transition)."""
     incident = IncidentRepository.get_by_id(db, incident_id)
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found")
     
     if "status" in updates:
+        old_status = incident.status
         incident.status = updates["status"]
+        if incident.status == "RESOLVED" and old_status != "RESOLVED":
+            incident.resolvedAt = datetime.datetime.utcnow()
+            background_tasks.add_task(dispatch_lessons_learned, incident_id)
+            
     if "severity" in updates:
         incident.severity = updates["severity"]
     if "priority" in updates:
@@ -126,8 +200,10 @@ def append_incident_log(incident_id: str, log_in: IncidentLogCreate, db: Session
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found")
     
-    # Enkrypt Middleware: encrypt sensitive log entries containing keys or credentials before saving
-    safe_message = log_in.message
+    # Enkrypt Middleware: scan and encrypt sensitive log entries containing keys or credentials before saving
+    scan_result = EnkryptMiddleware.scan_document(log_in.message, current_user, db)
+    safe_message = scan_result.get("sanitized_text", log_in.message)
+    
     if "api_key" in safe_message or "token" in safe_message or "password" in safe_message:
         safe_message = EnkryptMiddleware.encrypt_data(safe_message)
         
@@ -142,6 +218,12 @@ def append_incident_log(incident_id: str, log_in: IncidentLogCreate, db: Session
     db.add(new_log)
     db.commit()
     db.refresh(new_log)
+    
+    broadcast_sync("LOG_APPENDED", {
+        "incident_id": incident_id,
+        "log_id": new_log.id
+    })
+    
     return new_log
 
 
@@ -209,6 +291,13 @@ def upload_logs(incident_id: str, file: UploadFile = File(...), db: Session = De
         if logs_to_insert:
             db.add_all(logs_to_insert)
             db.commit()
+            broadcast_sync("LOG_APPENDED", {
+                "incident_id": incident_id,
+                "count": len(logs_to_insert)
+            })
+            
+            from app.telemetry import LOG_INGESTION_COUNTER
+            LOG_INGESTION_COUNTER.labels(source=ext).inc(len(logs_to_insert))
             
         return {"status": "success", "logs_inserted": len(logs_to_insert)}
         
@@ -218,6 +307,21 @@ def upload_logs(incident_id: str, file: UploadFile = File(...), db: Session = De
         if os.path.exists(temp_path):
             os.remove(temp_path)
 
+
+from tenacity import retry, wait_exponential, stop_after_attempt
+from app.logger import logger
+
+@retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(3), reraise=True)
+def _call_mastra_engine(incident_id: str, title: str, service: str, severity: str, logs_str: str):
+    mastra_url = "http://mastra_engine:3001/api/workflows/incident-response"
+    logger.info(f"Triggering Mastra engine for {incident_id}")
+    requests.post(mastra_url, json={
+        "incidentId": incident_id,
+        "title": title,
+        "service": service,
+        "severity": severity,
+        "logs": logs_str
+    }, timeout=5)
 
 @router.post("/{incident_id}/trigger-pipeline")
 def trigger_agent_pipeline(incident_id: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db), current_user = Depends(require_role(["Admin", "SRE", "DevOps"]))):
@@ -237,17 +341,9 @@ def trigger_agent_pipeline(incident_id: str, background_tasks: BackgroundTasks, 
 
     # Call Mastra TS Engine
     try:
-        # In docker, it's accessible via the service name `mastra_engine`. If running locally, you may need to use an env var.
-        mastra_url = "http://mastra_engine:3001/api/workflows/incident-response"
-        requests.post(mastra_url, json={
-            "incidentId": incident.id,
-            "title": incident.title,
-            "service": incident.service,
-            "severity": incident.severity,
-            "logs": logs_str
-        }, timeout=5)
+        _call_mastra_engine(incident.id, incident.title, incident.service, incident.severity, logs_str)
     except Exception as e:
-        print(f"Failed to trigger Mastra Engine: {e}")
+        logger.error(f"Failed to trigger Mastra Engine after retries: {e}")
 
     return {
         "status": "SUCCESS",

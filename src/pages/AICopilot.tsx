@@ -44,6 +44,21 @@ export const AICopilot: React.FC = () => {
   const [isGenerating, setIsGenerating] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
+  const [contextData, setContextData] = useState<{
+    suggestedQuestions: Array<{text: string, icon: string}>;
+    activeAlerts: number;
+    recentIncidents: Array<{id: string, title: string}>;
+  }>({
+    suggestedQuestions: [
+      { text: "Explain Incident INC-2026-001 in depth", icon: "ShieldAlert" },
+      { text: "Find PostgreSQL connection pool saturation SOPs", icon: "Database" },
+      { text: "Why was INC-2026-002 classified as infrastructure overload?", icon: "Cpu" },
+      { text: "Formulate a safe rollback recipe for product-catalog", icon: "Terminal" }
+    ],
+    activeAlerts: 0,
+    recentIncidents: []
+  });
+
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const scrollToBottom = () => {
@@ -54,12 +69,20 @@ export const AICopilot: React.FC = () => {
     scrollToBottom();
   }, [messages, isGenerating]);
 
-  const suggestedQuestions = [
-    { text: "Explain Incident INC-2026-001 in depth", icon: ShieldAlert },
-    { text: "Find PostgreSQL connection pool saturation SOPs", icon: Database },
-    { text: "Why was INC-2026-002 classified as infrastructure overload?", icon: Cpu },
-    { text: "Formulate a safe rollback recipe for product-catalog", icon: Terminal }
-  ];
+  useEffect(() => {
+    // Load context on mount
+    const fetchContext = async () => {
+      try {
+        const response = await apiRequest<any>('/api/v1/copilot/context');
+        if (response.data) {
+          setContextData(response.data);
+        }
+      } catch (err) {
+        console.error("Failed to load Copilot context", err);
+      }
+    };
+    fetchContext();
+  }, []);
 
   const handleCopyCode = (text: string, id: string) => {
     navigator.clipboard.writeText(text);
@@ -161,11 +184,18 @@ export const AICopilot: React.FC = () => {
       timestamp: new Date().toISOString()
     };
 
-    setMessages(prev => [...prev, newUserMessage]);
+    const assistantMsgId = `assistant-${Date.now()}`;
+    const initialAssistantMsg: ChatMessage = {
+      id: assistantMsgId,
+      role: 'assistant',
+      content: '',
+      timestamp: new Date().toISOString()
+    };
+
+    setMessages(prev => [...prev, newUserMessage, initialAssistantMsg]);
     setIsGenerating(true);
 
     try {
-      // Build chat history array mapping from frontend structure
       const chatHistoryPayload = messages
         .filter(m => m.id !== 'welcome')
         .map(m => ({
@@ -173,13 +203,14 @@ export const AICopilot: React.FC = () => {
           content: m.content
         }));
 
-      const response = await apiRequest<{
-        message: string;
-        referencedIncident: Record<string, any> | null;
-        retrievedDocuments: Array<Record<string, any>>;
-        guardrailStatus: Record<string, any>;
-      }>('/api/v1/copilot/chat', {
+      // We use native fetch for SSE support instead of apiRequest wrapper
+      const token = localStorage.getItem('token');
+      const response = await fetch('/api/v1/copilot/chat', {
         method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { 'Authorization': `Bearer ${token}` } : {})
+        },
         body: JSON.stringify({
           message: text,
           incidentId: selectedIncidentId || null,
@@ -187,31 +218,64 @@ export const AICopilot: React.FC = () => {
         })
       });
 
-      if (response.data) {
-        const assistantMsg: ChatMessage = {
-          id: `assistant-${Date.now()}`,
-          role: 'assistant',
-          content: response.data.message,
-          timestamp: new Date().toISOString(),
-          referencedIncident: response.data.referencedIncident,
-          retrievedDocuments: response.data.retrievedDocuments,
-          guardrailStatus: response.data.guardrailStatus
-        };
-        setMessages(prev => [...prev, assistantMsg]);
-      } else {
-        throw new Error("Empty response received from Copilot endpoint");
+      if (!response.body) throw new Error("No response body");
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let doneReading = false;
+      let buffer = '';
+
+      while (!doneReading) {
+        const { value, done } = await reader.read();
+        if (done) {
+          doneReading = true;
+          break;
+        }
+
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split('\n\n');
+        buffer = parts.pop() || '';
+
+        for (const part of parts) {
+          if (part.startsWith('data: ')) {
+            const dataStr = part.substring(6);
+            try {
+              const data = JSON.parse(dataStr);
+              
+              setMessages(prev => prev.map(msg => {
+                if (msg.id === assistantMsgId) {
+                  return {
+                    ...msg,
+                    content: msg.content + (data.chunk || ''),
+                    referencedIncident: data.referencedIncident || msg.referencedIncident,
+                    retrievedDocuments: data.retrievedDocuments || msg.retrievedDocuments,
+                    guardrailStatus: data.guardrailStatus || msg.guardrailStatus
+                  };
+                }
+                return msg;
+              }));
+
+              if (data.done) {
+                doneReading = true;
+              }
+            } catch (e) {
+              console.error("SSE parse error", e, dataStr);
+            }
+          }
+        }
       }
     } catch (err: any) {
       console.error(err);
-      // Graceful local error fallback display
-      const errorMsg: ChatMessage = {
-        id: `assistant-error-${Date.now()}`,
-        role: 'assistant',
-        content: `### ⚠️ SRE Pipeline Gateway Timeout\n\nCould not resolve Gemini connection channel. Ensure the core FastAPI backend services and port forwardings are fully initialized.\n\n*Detailed Error log: ${err?.message || "Connection Refused"}*`,
-        timestamp: new Date().toISOString(),
-        guardrailStatus: { inputStatus: 'PASSED', outputStatus: 'FAILED', inputThreats: [], outputThreats: ['Connection Fail'] }
-      };
-      setMessages(prev => [...prev, errorMsg]);
+      setMessages(prev => prev.map(msg => {
+        if (msg.id === assistantMsgId) {
+           return {
+             ...msg,
+             content: `### ⚠️ SRE Pipeline Gateway Timeout\n\nCould not resolve Gemini connection channel. Ensure the core FastAPI backend services and port forwardings are fully initialized.\n\n*Detailed Error log: ${err?.message || "Connection Refused"}*`,
+             guardrailStatus: { inputStatus: 'PASSED', outputStatus: 'FAILED', inputThreats: [], outputThreats: ['Connection Fail'] }
+           };
+        }
+        return msg;
+      }));
     } finally {
       setIsGenerating(false);
     }
@@ -360,8 +424,13 @@ export const AICopilot: React.FC = () => {
           <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
             <h4 className="font-sans font-bold text-slate-200 text-xs uppercase tracking-wider">Suggested Scenarios</h4>
             <div className="space-y-2.5">
-              {suggestedQuestions.map((q) => {
-                const QIcon = q.icon;
+              {contextData.suggestedQuestions.map((q) => {
+                let QIcon = FileText;
+                if (q.icon === "ShieldAlert") QIcon = ShieldAlert;
+                if (q.icon === "Cpu") QIcon = Cpu;
+                if (q.icon === "Database") QIcon = Database;
+                if (q.icon === "Terminal") QIcon = Terminal;
+
                 return (
                   <button
                     key={q.text}

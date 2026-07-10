@@ -70,11 +70,14 @@ class User(AuditMixin, Base):
     )
     audit_logs = relationship("AuditLog", back_populates="user")
     settings   = relationship("Settings", back_populates="user", uselist=False, cascade="all, delete-orphan")
+    api_keys   = relationship("ApiKey", back_populates="user", cascade="all, delete-orphan")
+    sessions   = relationship("UserSession", back_populates="user", cascade="all, delete-orphan")
+    identities = relationship("UserIdentity", back_populates="user", cascade="all, delete-orphan")
 
     # ── Constraints ──────────────────────────────────────────────────────────
     __table_args__ = (
         CheckConstraint(
-            "role IN ('Admin', 'SRE', 'Security Analyst', 'DevOps', 'Viewer')",
+            "role IN ('Admin', 'SRE', 'Security Analyst', 'DevOps', 'Viewer', 'Knowledge Manager')",
             name="valid_user_roles",
         ),
         CheckConstraint(

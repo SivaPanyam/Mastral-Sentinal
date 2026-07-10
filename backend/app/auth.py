@@ -43,16 +43,11 @@ def _get_fernet(key: str) -> Any:
 class EnkryptMiddleware:
     """
     Enkrypt Middleware Abstraction:
-    Provides custom payload field encryption/decryption (AES key wrapper)
-    to encrypt highly sensitive environmental fields (such as access tokens, passwords, and private API keys)
-    before saving them in persistent storage or database logs, as well as checking system payload integrity.
+    Provides custom payload field encryption/decryption and official Enkrypt AI integration
+    for role-based security guardrails across inputs, outputs, and documents.
     """
     @staticmethod
     def encrypt_data(plain_text: str, key: str = settings.SECRET_KEY) -> str:
-        """
-        Encrypts sensitive fields like access keys, environmental configurations, or logs
-        using production-grade Fernet symmetric encryption.
-        """
         try:
             f = _get_fernet(key)
             return f.encrypt(plain_text.encode('utf-8')).decode('utf-8')
@@ -61,14 +56,10 @@ class EnkryptMiddleware:
 
     @staticmethod
     def decrypt_data(cipher_text: str, key: str = settings.SECRET_KEY) -> str:
-        """
-        Decrypts sensitive fields back to standard unicode plain_text.
-        """
         try:
             f = _get_fernet(key)
             return f.decrypt(cipher_text.encode('utf-8')).decode('utf-8')
         except Exception:
-            # Fallback to avoid breaking on plaintext or old XOR-encrypted entries
             try:
                 import base64
                 raw_bytes = base64.b64decode(cipher_text.encode('utf-8'))
@@ -79,120 +70,166 @@ class EnkryptMiddleware:
                 return cipher_text
 
     @staticmethod
-    def validate_input(input_text: str) -> Dict[str, Any]:
-        """
-        Scan input text for security and compliance threats using official Enkrypt Sentry API,
-        with fallback to local regex-based scanning.
-        """
-        global _enkrypt_client
-        if _enkrypt_client:
-            try:
-                from enkryptai_sdk import GuardrailsConfig
-                config = GuardrailsConfig()
+    def _log_security_event(db, user_id: str, action: str, threats: list, text: str):
+        if not db: return
+        try:
+            from app.models.audit_log import AuditLog
+            log = AuditLog(
+                userId=user_id,
+                action=action,
+                resourceType="Enkrypt Guardrails",
+                details={"threats": threats, "snippet": text[:100] + "..." if len(text) > 100 else text},
+                response_status="BLOCKED"
+            )
+            db.add(log)
+            db.commit()
+        except Exception as e:
+            print(f"Failed to log security event: {e}")
+
+    @staticmethod
+    def _get_role_config(role: str, is_output: bool = False, is_document: bool = False):
+        from enkryptai_sdk import GuardrailsConfig
+        config = GuardrailsConfig()
+        
+        # Determine strictness
+        is_strict = role in ["Viewer", "DevOps"]
+        
+        if is_document:
+            config.update(
+                pii={"enabled": True, "entities": ["secrets", "email", "phone_number", "ssn", "credit_card"], "redact": True},
+                toxicity={"enabled": True},
+                policy_violation={"enabled": True}
+            )
+            return config
+
+        if is_output:
+            if is_strict:
+                config.update(
+                    pii={"enabled": True, "entities": ["secrets", "email", "phone_number", "ssn", "credit_card"], "redact": True},
+                    toxicity={"enabled": True}
+                )
+            else:
+                config.update(
+                    pii={"enabled": True, "entities": ["secrets"], "redact": False},
+                    toxicity={"enabled": True}
+                )
+        else:
+            if is_strict:
                 config.update(
                     pii={"enabled": True, "entities": ["secrets", "email", "phone_number", "ssn", "credit_card"]},
                     injection_attack={"enabled": True},
                     policy_violation={"enabled": True}
                 )
+            else:
+                config.update(
+                    pii={"enabled": True, "entities": ["secrets"]},
+                    injection_attack={"enabled": True},
+                    policy_violation={"enabled": True}
+                )
+        return config
+
+    @staticmethod
+    def validate_input(input_text: str, current_user: dict = None, db = None) -> Dict[str, Any]:
+        global _enkrypt_client
+        role = current_user.get("role", "Viewer") if current_user else "Viewer"
+        user_id = current_user.get("email", "anonymous") if current_user else "anonymous"
+
+        if _enkrypt_client:
+            try:
+                config = EnkryptMiddleware._get_role_config(role, is_output=False)
                 response = _enkrypt_client.detect(input_text, config=config)
                 if response.has_violations():
                     violations = response.get_violations()
-                    mapped_threats = []
-                    for v in violations:
-                        if v == "injection_attack":
-                            mapped_threats.append("Potential Prompt Injection Attack Detected")
-                        elif v == "pii":
-                            mapped_threats.append("Potential Personal Identifiable Information (PII) / Secret Leak")
-                        elif v == "policy_violation":
-                            mapped_threats.append("Potential Policy Violation")
-                        else:
-                            mapped_threats.append(f"Security Alert: {v}")
+                    mapped_threats = [f"Security Alert: {v}" for v in violations]
+                    EnkryptMiddleware._log_security_event(db, user_id, "ENKRYPT_INPUT_BLOCK", mapped_threats, input_text)
                     return {"status": "ALERT", "threats": mapped_threats, "sanitized": True}
                 return {"status": "PASSED", "threats": [], "sanitized": False}
             except Exception as e:
-                print(f"Enkrypt API validation error: {e}. Falling back to local regex scanner.")
+                print(f"Enkrypt API error: {e}. Fallback to regex.")
 
-        # Fallback local regex scanning
+        # Fallback
         import re
         threats = []
+        sql_patterns = [r"(?i)\bUNION\b.*\bSELECT\b", r"(?i)\bSELECT\b.*\bFROM\b", r"(?i)'\s*OR\s*'\d+'\s*=\s*'\d+"]
+        for p in sql_patterns:
+            if re.search(p, input_text): threats.append("Potential SQL Injection")
         
-        # SQL Injection patterns
-        sql_patterns = [
-            r"(?i)\bUNION\b.*\bSELECT\b",
-            r"(?i)\bSELECT\b.*\bFROM\b",
-            r"(?i)'\s*OR\s*'\d+'\s*=\s*'\d+",
-        ]
-        for pattern in sql_patterns:
-            if re.search(pattern, input_text):
-                threats.append("Potential SQL Injection Pattern Detected")
-                
-        # Secrets/Credentials patterns
-        credential_patterns = [
-            r"(?i)(password|passwd|pass|pwd|secret|token|api_key|apikey|private_key)\s*[:=\s]+[a-zA-Z0-9_\-\.\~]{8,}",
-            r"AIzaSy[a-zA-Z0-9_\-]{33}",  # Google API key pattern
-        ]
-        for pattern in credential_patterns:
-            if re.search(pattern, input_text):
-                threats.append("Potential Sensitive Credential/Key Exposure")
-                
-        # PII (SSN, credit cards)
-        pii_patterns = [
-            r"\b\d{3}-\d{2}-\d{4}\b",  # SSN
-            r"\b(?:\d[ -]*?){13,16}\b",  # Credit Card
-        ]
-        for pattern in pii_patterns:
-            if re.search(pattern, input_text):
-                threats.append("Potential Personal Identifiable Information (PII) Leak")
-                
+        credential_patterns = [r"(?i)(password|secret|api_key)\s*[:=\s]+[a-zA-Z0-9_\-\.\~]{8,}", r"AIzaSy[a-zA-Z0-9_\-]{33}"]
+        for p in credential_patterns:
+            if re.search(p, input_text): threats.append("Credential Exposure")
+            
         if threats:
+            EnkryptMiddleware._log_security_event(db, user_id, "ENKRYPT_INPUT_BLOCK_FALLBACK", threats, input_text)
             return {"status": "ALERT", "threats": threats, "sanitized": True}
         return {"status": "PASSED", "threats": [], "sanitized": False}
 
     @staticmethod
-    def validate_output(output_text: str) -> Dict[str, Any]:
-        """
-        Scan output text generated by LLM for potential credentials leak or toxic hallucinated secrets.
-        """
+    def validate_output(output_text: str, current_user: dict = None, db = None) -> Dict[str, Any]:
         global _enkrypt_client
+        role = current_user.get("role", "Viewer") if current_user else "Viewer"
+        user_id = current_user.get("email", "anonymous") if current_user else "anonymous"
+
         if _enkrypt_client:
             try:
-                from enkryptai_sdk import GuardrailsConfig
-                config = GuardrailsConfig()
-                config.update(
-                    pii={"enabled": True, "entities": ["secrets", "email", "phone_number", "ssn", "credit_card"]},
-                    toxicity={"enabled": True}
-                )
+                config = EnkryptMiddleware._get_role_config(role, is_output=True)
                 response = _enkrypt_client.detect(output_text, config=config)
                 if response.has_violations():
                     violations = response.get_violations()
-                    mapped_threats = []
-                    for v in violations:
-                        if v == "pii":
-                            mapped_threats.append("Leaked Cryptographic Material / Key in LLM Generation")
-                        elif v == "toxicity":
-                            mapped_threats.append("Toxic or Unsafe Content Generated by LLM")
-                        else:
-                            mapped_threats.append(f"Security Alert: {v}")
+                    mapped_threats = [f"Security Alert: {v}" for v in violations]
+                    EnkryptMiddleware._log_security_event(db, user_id, "ENKRYPT_OUTPUT_BLOCK", mapped_threats, output_text)
                     return {"status": "ALERT", "threats": mapped_threats, "sanitized": True}
                 return {"status": "PASSED", "threats": [], "sanitized": False}
             except Exception as e:
-                print(f"Enkrypt API validation error: {e}. Falling back to local regex scanner.")
+                print(f"Enkrypt API error: {e}. Fallback to regex.")
 
-        # Fallback local regex scanning
         import re
         threats = []
-        
-        # Similar password/secret leaks in output
-        secret_patterns = [
-            r"(?i)(password|secret|token|private_key|api_key)\s*[:=\s]+[a-zA-Z0-9_\-\.\~]{10,}",
-        ]
-        for pattern in secret_patterns:
-            if re.search(pattern, output_text):
-                threats.append("Leaked Cryptographic Material / Key in LLM Generation")
+        secret_patterns = [r"(?i)(password|secret|private_key|api_key)\s*[:=\s]+[a-zA-Z0-9_\-\.\~]{10,}"]
+        for p in secret_patterns:
+            if re.search(p, output_text): threats.append("Leaked Cryptographic Material")
                 
         if threats:
+            EnkryptMiddleware._log_security_event(db, user_id, "ENKRYPT_OUTPUT_BLOCK_FALLBACK", threats, output_text)
             return {"status": "ALERT", "threats": threats, "sanitized": True}
         return {"status": "PASSED", "threats": [], "sanitized": False}
+
+    @staticmethod
+    def scan_document(document_text: str, current_user: dict = None, db = None) -> Dict[str, Any]:
+        """Scans uploaded documents and incidents for secrets, toxicity, and leakage."""
+        global _enkrypt_client
+        role = current_user.get("role", "SRE") if current_user else "SRE"
+        user_id = current_user.get("email", "anonymous") if current_user else "anonymous"
+
+        if _enkrypt_client:
+            try:
+                config = EnkryptMiddleware._get_role_config(role, is_document=True)
+                response = _enkrypt_client.detect(document_text, config=config)
+                
+                # Retrieve redacted text if applicable
+                sanitized_text = document_text
+                try:
+                    if hasattr(response, 'text'): sanitized_text = response.text
+                except Exception:
+                    pass
+
+                if response.has_violations():
+                    violations = response.get_violations()
+                    mapped_threats = [f"Document Security Alert: {v}" for v in violations]
+                    EnkryptMiddleware._log_security_event(db, user_id, "ENKRYPT_DOCUMENT_QUARANTINE", mapped_threats, document_text)
+                    return {"status": "QUARANTINED", "threats": mapped_threats, "sanitized_text": sanitized_text}
+                return {"status": "PASSED", "threats": [], "sanitized_text": document_text}
+            except Exception as e:
+                print(f"Enkrypt API error on document scan: {e}")
+
+        # Fallback
+        import re
+        threats = []
+        if re.search(r"(?i)(password|secret|private_key)\s*[:=\s]+[a-zA-Z0-9_\-\.\~]{10,}", document_text):
+            threats.append("Leaked Secrets")
+        if threats:
+            EnkryptMiddleware._log_security_event(db, user_id, "ENKRYPT_DOCUMENT_QUARANTINE_FALLBACK", threats, document_text)
+            return {"status": "QUARANTINED", "threats": threats, "sanitized_text": document_text}
+        return {"status": "PASSED", "threats": [], "sanitized_text": document_text}
 
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
@@ -259,6 +296,39 @@ def require_role(allowed_roles: list):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"Insufficient permissions. Required roles: {allowed_roles}"
+            )
+        return current_user
+    return dependency
+
+ROLE_PERMISSIONS = {
+    "Admin": ["*"],
+    "SRE": [
+        "incidents:read", "incidents:write",
+        "logs:read", "agents:execute", "reports:read", "reports:write", "knowledge:read"
+    ],
+    "Security Analyst": [
+        "incidents:read", "logs:read", "audit:read", "security:write", "reports:read", "knowledge:read"
+    ],
+    "DevOps": [
+        "incidents:read", "incidents:write", "logs:read", "agents:execute", "knowledge:read"
+    ],
+    "Knowledge Manager": [
+        "incidents:read", "knowledge:read", "knowledge:write", "reports:read"
+    ],
+    "Viewer": [
+        "incidents:read", "logs:read", "reports:read", "knowledge:read"
+    ]
+}
+
+def require_permission(required_permission: str):
+    def dependency(current_user: Dict[str, Any] = Depends(get_current_user)):
+        role = current_user.get("role", "Viewer")
+        user_permissions = ROLE_PERMISSIONS.get(role, [])
+        if "*" not in user_permissions and required_permission not in user_permissions:
+            # We could also log a forbidden access attempt here
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Insufficient permissions. Required permission: {required_permission}"
             )
         return current_user
     return dependency

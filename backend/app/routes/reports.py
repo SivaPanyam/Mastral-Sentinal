@@ -59,16 +59,22 @@ def get_report_by_incident(incident_id: str, db: Session = Depends(get_db)):
 @router.post("/", response_model=ReportOut, status_code=status.HTTP_201_CREATED)
 def create_report(report_in: ReportCreate, db: Session = Depends(get_db), current_user = Depends(require_role(["Admin", "SRE", "DevOps"]))):
     """Manually document an incident root cause report."""
+    from app.auth import EnkryptMiddleware
+    
+    # SCAN REPORT FOR LEAKS
+    scan_summary = EnkryptMiddleware.scan_document(report_in.summary, current_user, db)
+    scan_root_cause = EnkryptMiddleware.scan_document(report_in.rootCause, current_user, db)
+    
     report_id = f"REP-2026-{uuid.uuid4().hex[:4].upper()}"
     new_report = Report(
         id=report_id,
         incidentId=report_in.incidentId,
         title=report_in.title,
-        summary=report_in.summary,
-        rootCause=report_in.rootCause,
+        summary=scan_summary.get("sanitized_text", report_in.summary),
+        rootCause=scan_root_cause.get("sanitized_text", report_in.rootCause),
         impact=report_in.impact,
-        timeline=[event.dict() for event in report_in.timeline],
-        actionItems=[item.dict() for item in report_in.actionItems],
+        timeline=[event.dict() if hasattr(event, "dict") else event.model_dump() for event in report_in.timeline],
+        actionItems=[item.dict() if hasattr(item, "dict") else item.model_dump() for item in report_in.actionItems],
         createdBy=report_in.createdBy
     )
     return ReportRepository.create(db, new_report)

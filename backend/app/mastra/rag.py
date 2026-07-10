@@ -5,39 +5,67 @@ import json
 import re
 import time
 import requests
+import logging
 from typing import List, Dict, Any, Optional
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
-from pypdf import PdfReader
 from app.config import settings
-from app.ingestion.chunking import chunk_text
+from app.knowledge.loaders import get_loader
+from app.knowledge.chunking import ChunkingEngine
+
+logger = logging.getLogger(__name__)
 
 class EmbeddingService:
     def __init__(self):
-        self.base_url = os.getenv("OLLAMA_BASE_URL", settings.OLLAMA_BASE_URL)
-        if not self.base_url.endswith("/api/embeddings"):
-            self.endpoint = f"{self.base_url.rstrip('/')}/api/embeddings"
+        self.provider = getattr(settings, "EMBEDDING_PROVIDER", "ollama").lower()
+        self.ollama_base_url = os.getenv("OLLAMA_BASE_URL", settings.OLLAMA_BASE_URL)
+        if not self.ollama_base_url.endswith("/api/embeddings"):
+            self.ollama_endpoint = f"{self.ollama_base_url.rstrip('/')}/api/embeddings"
         else:
-            self.endpoint = self.base_url
+            self.ollama_endpoint = self.ollama_base_url
+            
+        self.gemini_client = None
+        if self.provider == "google":
+            try:
+                from google import genai
+                gemini_api_key = os.getenv("GEMINI_API_KEY")
+                if gemini_api_key:
+                    self.gemini_client = genai.Client(api_key=gemini_api_key)
+                else:
+                    logger.warning("GEMINI_API_KEY missing, falling back to Ollama")
+                    self.provider = "ollama"
+            except ImportError:
+                logger.warning("google-genai not installed, falling back to Ollama")
+                self.provider = "ollama"
+
+    @property
+    def vector_size(self) -> int:
+        return 768 if self.provider == "google" else 768 # nomic-embed-text is 768, text-embedding-004 is 768
 
     def get_embedding(self, text: str, retries: int = 5, backoff_factor: float = 2.0) -> List[float]:
         for attempt in range(retries):
             try:
-                payload = {
-                    "model": "nomic-embed-text",
-                    "prompt": text
-                }
-                response = requests.post(self.endpoint, json=payload, timeout=30)
-                response.raise_for_status()
-                data = response.json()
-                return data.get("embedding", [])
+                if self.provider == "google" and self.gemini_client:
+                    result = self.gemini_client.models.embed_content(
+                        model="text-embedding-004",
+                        contents=text
+                    )
+                    return result.embeddings[0].values
+                else:
+                    payload = {
+                        "model": "nomic-embed-text",
+                        "prompt": text
+                    }
+                    response = requests.post(self.ollama_endpoint, json=payload, timeout=30)
+                    response.raise_for_status()
+                    data = response.json()
+                    return data.get("embedding", [])
             except Exception as e:
                 if attempt < retries - 1:
                     sleep_time = backoff_factor ** attempt
-                    print(f"Embedding retry: Rate limit/error hit. Retrying in {sleep_time} seconds (Attempt {attempt+1}/{retries})...")
                     time.sleep(sleep_time)
                     continue
-                print(f"Failed to get embedding: {e}")
+                logger.error(f"Failed to get embedding: {e}")
                 raise e
 
 class QdrantService:
@@ -50,9 +78,11 @@ class QdrantService:
                 api_key=settings.QDRANT_API_KEY if settings.QDRANT_API_KEY else None
             )
         except Exception as e:
-            raise ConnectionError(f"Could not connect to Qdrant cluster: {e}")
+            logger.error(f"Could not connect to Qdrant cluster: {e}")
+            self.client = None
 
     def ensure_collection_exists(self, vector_size: int = 768):
+        if not self.client: return
         try:
             collections = self.client.get_collections().collections
             exists = any(c.name == self.collection_name for c in collections)
@@ -65,30 +95,31 @@ class QdrantService:
                     )
                 )
         except Exception as e:
-            print(f"Failed to verify Qdrant collections: {e}")
+            logger.error(f"Failed to verify Qdrant collections: {e}")
 
     def upsert_points(self, points: List[qmodels.PointStruct]):
+        if not self.client: return
         self.client.upsert(
             collection_name=self.collection_name,
             points=points
         )
 
-    def search_points(self, query_vector: List[float], limit: int = 3):
+    def search_points(self, query_vector: List[float], query_filter: Optional[qmodels.Filter] = None, limit: int = 3):
+        if not self.client: return []
         return self.client.query_points(
             collection_name=self.collection_name,
             query=query_vector,
-            limit=limit
+            query_filter=query_filter,
+            limit=limit,
+            with_payload=True
         ).points
 
 class RAGService:
     def __init__(self):
         self.embedder = EmbeddingService()
         self.qdrant = QdrantService()
-        self.qdrant.ensure_collection_exists(vector_size=768)
-
-    def _chunk_text(self, text: str, chunk_size: int = 1000, overlap: int = 200) -> List[str]:
-        """Splits raw text into overlapping chunks using ingestion rules."""
-        return chunk_text(text, chunk_size, overlap)
+        self.qdrant.ensure_collection_exists(vector_size=self.embedder.vector_size)
+        self.chunker = ChunkingEngine(chunk_size=1000, overlap=200, strategy="semantic")
 
     def extract_metadata(self, text: str) -> Dict[str, str]:
         try:
@@ -109,71 +140,54 @@ class RAGService:
             if json_str:
                 return json.loads(json_str.group(0))
         except Exception as e:
-            print(f"Metadata extraction failed: {e}")
+            logger.error(f"Metadata extraction failed: {e}")
         return {"title": "Unknown Document", "service": "unknown", "type": "UNKNOWN"}
 
     def ingest_file(self, file_path: str, metadata: Dict[str, Any] = None):
-        """Production pipeline for extracting text from TXT, MD, PDF, DOCX and indexing."""
-        ext = file_path.split('.')[-1].lower()
-        content = ""
+        """Production pipeline for extracting text and indexing via Loaders."""
+        loader = get_loader(file_path)
+        pages = list(loader.load())
         
-        if ext in ["txt", "md"]:
-            with open(file_path, "r", encoding="utf-8") as f:
-                content = f.read()
-        elif ext == "pdf":
-            try:
-                reader = PdfReader(file_path)
-                for page in reader.pages:
-                    extracted = page.extract_text()
-                    if extracted:
-                        content += extracted + "\n"
-            except Exception as e:
-                print(f"Error reading PDF {file_path}: {e}")
-        elif ext == "docx":
-            try:
-                from docx import Document
-                doc = Document(file_path)
-                content = "\n".join([para.text for para in doc.paragraphs])
-            except Exception as e:
-                print(f"Error reading DOCX {file_path}: {e}")
-        elif ext == "ipynb":
-            try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    nb = json.load(f)
-                    for cell in nb.get("cells", []):
-                        if cell.get("cell_type") in ["markdown", "code"]:
-                            src = cell.get("source", [])
-                            if isinstance(src, list):
-                                src = "".join(src)
-                            if src:
-                                content += src + "\n\n"
-            except Exception as e:
-                print(f"Error reading notebook {file_path}: {e}")
-        else:
-            raise ValueError(f"Unsupported file type: {ext}")
-
-        content_hash = hashlib.sha256(content.encode('utf-8')).hexdigest()
+        full_content = "\n".join([p.get("content", "") for p in pages])
+        content_hash = hashlib.sha256(full_content.encode('utf-8')).hexdigest()
+        
         if not metadata:
-            metadata = self.extract_metadata(content)
+            metadata = self.extract_metadata(full_content)
 
         doc_id = metadata.get("doc_id", f"FILE-{uuid.uuid4().hex[:8]}")
         title = metadata.get("title", os.path.basename(file_path))
         
-        return {"doc_id": doc_id, "content_hash": content_hash, "metadata": metadata, "content": content, "title": title}
+        return {
+            "doc_id": doc_id, 
+            "content_hash": content_hash, 
+            "metadata": metadata, 
+            "content": full_content, 
+            "title": title,
+            "pages": pages
+        }
 
-    def index_document(self, doc_id: str, title: str, content: str, metadata: Dict[str, Any]):
-        """Chunks document, calls EmbeddingService, and stores in QdrantService."""
-        chunks = self._chunk_text(content)
+    def index_document(self, doc_id: str, title: str, content: str, metadata: Dict[str, Any], pages: List[Dict[str, Any]] = None):
+        """Chunks document, calls EmbeddingService, and stores in QdrantService with enriched metadata."""
+        if not pages:
+            pages = [{"content": content, "page_number": 1}]
+            
+        chunks = self.chunker.chunk_document(pages)
         
         points = []
         for i, chunk in enumerate(chunks):
-            vector = self.embedder.get_embedding(chunk)
+            vector = self.embedder.get_embedding(chunk["content"])
             payload = {
-                "title": title,
-                "content": chunk,
                 "doc_id": doc_id,
-                "chunk_index": i,
-                **metadata
+                "title": title,
+                "content": chunk["content"],
+                "chunk_id": f"{doc_id}-chunk-{i}",
+                "page_number": chunk.get("page_number", 1),
+                "doc_type": metadata.get("type", "UNKNOWN"),
+                "service": metadata.get("service", "unknown"),
+                "author": metadata.get("author", "system"),
+                "environment": metadata.get("environment", "all"),
+                "embedding_model": self.embedder.provider,
+                "created_date": str(int(time.time()))
             }
             # Generate deterministic UUID point ID based on doc_id and chunk index
             point_id = str(uuid.uuid5(uuid.NAMESPACE_OID, f"{doc_id}_{i}"))
@@ -185,23 +199,58 @@ class RAGService:
                 batch = points[i:i+batch_size]
                 self.qdrant.upsert_points(batch)
 
-    def query_sop_runbooks(self, query: str, limit: int = 3) -> List[Dict[str, Any]]:
-        """Maintains the legacy interface expected by workflows.py but returns full metadata."""
+    def _cross_encoder_rerank(self, query: str, results: List[Any]) -> List[Any]:
+        """Local mocked cross-encoder re-ranking for Hybrid Retrieval."""
+        # A real implementation would use `cross-encoder/ms-marco-MiniLM-L-6-v2`
+        # Here we do a mocked keyword boosting over semantic scores to simulate hybrid reranking
+        for r in results:
+            content = r.payload.get("content", "").lower()
+            q_lower = query.lower()
+            keyword_bonus = 0.0
+            for word in q_lower.split():
+                if len(word) > 4 and word in content:
+                    keyword_bonus += 0.05
+            
+            # Simulated confidence calculation
+            r.score = min(1.0, r.score + keyword_bonus)
+            
+        # Sort by updated scores
+        return sorted(results, key=lambda x: x.score, reverse=True)
+
+    def query_sop_runbooks(self, query: str, limit: int = 3, filter_conditions: Dict[str, str] = None) -> List[Dict[str, Any]]:
+        """Hybrid Search: Vector Similarity + Metadata Filtering + CrossEncoder Re-Ranking"""
         query_vector = self.embedder.get_embedding(query)
-        results = self.qdrant.search_points(query_vector=query_vector, limit=limit)
+        
+        # Build Qdrant Filter
+        q_filter = None
+        if filter_conditions:
+            must_clauses = []
+            for key, value in filter_conditions.items():
+                must_clauses.append(qmodels.FieldCondition(key=key, match=qmodels.MatchValue(value=value)))
+            q_filter = qmodels.Filter(must=must_clauses)
+            
+        # Fetch 2x limit for reranking pool
+        results = self.qdrant.search_points(query_vector=query_vector, query_filter=q_filter, limit=limit * 2)
+        
+        # Re-Rank
+        reranked_results = self._cross_encoder_rerank(query, results)
+        
+        # Take top limit
+        final_results = reranked_results[:limit]
         
         enhanced_results = []
-        for r in results:
+        for r in final_results:
             payload = r.payload or {}
             enhanced_results.append({
                 "content": payload.get("content", ""),
                 "score": r.score,
+                "confidence": f"{int(r.score * 100)}%",
                 "title": payload.get("title", "Unknown"),
                 "doc_id": payload.get("doc_id"),
-                "chunk_index": payload.get("chunk_index"),
+                "chunk_id": payload.get("chunk_id"),
+                "page_number": payload.get("page_number", 1),
                 "service": payload.get("service"),
-                "type": payload.get("type"),
-                "incident_id": payload.get("incident_id")
+                "type": payload.get("doc_type"),
             })
         return enhanced_results
 
@@ -224,10 +273,9 @@ try:
         metadata={"type": "RUNBOOK", "service": "k8s-cluster"}
     )
 except Exception as e:
-    print(f"Skipping RAG initialization and seeding due to missing dependencies: {e}")
-    # Creating a stub rag_manager to avoid ImportErrors in workflows.py
-    # if services fail to boot (e.g. no Qdrant connection).
+    logger.error(f"Skipping RAG initialization and seeding due to missing dependencies: {e}")
     class StubRagManager:
-        def query_sop_runbooks(self, query: str, limit: int = 3): return []
-        def index_document(self, doc_id: str, title: str, content: str, metadata: Dict[str, Any]): pass
+        def query_sop_runbooks(self, query: str, limit: int = 3, filter_conditions: Dict[str, str] = None): return []
+        def index_document(self, doc_id: str, title: str, content: str, metadata: Dict[str, Any], pages=None): pass
+        def ingest_file(self, file_path: str, metadata: Dict[str, Any] = None): return {}
     rag_manager = StubRagManager()

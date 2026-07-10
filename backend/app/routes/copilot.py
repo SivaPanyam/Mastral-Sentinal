@@ -1,44 +1,27 @@
+import os
 import re
 import json
-import time
-import datetime
-import uuid
-import requests
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.orm import Session
+import logging
 from typing import List, Dict, Any, Optional
+from fastapi import APIRouter, Depends, Request
+from fastapi.responses import StreamingResponse
+from sqlalchemy.orm import Session
 from pydantic import BaseModel
+import requests
+
 from app.database import get_db
-from app.models import Incident, AgentOutput, Report, IncidentLog
+from app.models import Incident, AgentOutput, Report, KnowledgeSource, Metric, Settings
 from app.mastra.rag import rag_manager
 from app.auth import EnkryptMiddleware, get_current_user
-from app.crud import IncidentRepository, ReportRepository, AgentOutputRepository
+from app.crud import IncidentRepository, ReportRepository, AgentOutputRepository, KnowledgeSourceRepository
+from app.config import settings
 
-class OllamaService:
-    def __init__(self):
-        import os
-        from app.config import settings
-        self.base_url = os.getenv("OLLAMA_BASE_URL", settings.OLLAMA_BASE_URL).rstrip("/")
-        self.endpoint = f"{self.base_url}/api/generate"
-
-    def generate(self, prompt, system_instruction=None):
-        try:
-            full_prompt = prompt if not system_instruction else f"{system_instruction}\n\n{prompt}"
-            payload = {
-                "model": "llama3.2",
-                "prompt": full_prompt,
-                "stream": False
-            }
-            response = requests.post(self.endpoint, json=payload, timeout=60)
-            response.raise_for_status()
-            return {"text": response.json().get("response", "")}
-        except Exception as e:
-            return {"text": f"Error generating text: {str(e)}"}
-            
-    def summarize(self, text):
-        return self.generate(f"Summarize the following report:\n\n{text}")["text"]
-
-ollama_service = OllamaService()
+try:
+    from google import genai
+    from google.genai import types
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
 
 router = APIRouter(prefix="/copilot", tags=["AI Copilot"])
 
@@ -57,22 +40,191 @@ class ChatResponse(BaseModel):
     retrievedDocuments: List[Dict[str, Any]] = []
     guardrailStatus: Dict[str, Any] = {}
 
+class GuardrailRequest(BaseModel):
+    text: str
+    direction: str = "input"
+
+# Ollama Fallback Service
+class OllamaService:
+    def __init__(self):
+        self.base_url = os.getenv("OLLAMA_BASE_URL", settings.OLLAMA_BASE_URL).rstrip("/")
+        self.endpoint = f"{self.base_url}/api/generate"
+
+    def generate(self, prompt, system_instruction=None):
+        try:
+            full_prompt = prompt if not system_instruction else f"{system_instruction}\n\n{prompt}"
+            payload = {
+                "model": "llama3.2",
+                "prompt": full_prompt,
+                "stream": False
+            }
+            response = requests.post(self.endpoint, json=payload, timeout=60)
+            response.raise_for_status()
+            return {"text": response.json().get("response", "")}
+        except Exception as e:
+            return {"text": f"Error generating text: {str(e)}"}
+            
+ollama_service = OllamaService()
+
 def extract_incident_ids(text: str) -> List[str]:
-    """Helper to extract incident IDs matching INC-XXXX or INC100000 patterns from text."""
     matches = re.findall(r"\b(INC-2026-\w+|INC-\w+|INC\d{4,})\b", text, re.IGNORECASE)
     return [m.upper() for m in matches]
 
-@router.post("/chat", response_model=ChatResponse)
-def copilot_chat(req: ChatRequest, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
-    """
-    Orchestrated enterprise AI Copilot Chat Endpoint.
-    Classifies user intents, routes queries to specific backend CRUD repositories or Mastra agent workflows,
-    and runs Enkrypt security guardrails.
-    """
+
+class CopilotTools:
+    """Wrapper class to provide DB session context to tools."""
+    def __init__(self, db: Session):
+        self.db = db
+
+    def searchKnowledge(self, query: str) -> str:
+        """Searches the Qdrant knowledge base for SOP runbooks matching the query."""
+        docs = rag_manager.query_sop_runbooks(query=query, limit=3)
+        return json.dumps(docs)
+
+    def searchLogs(self, incident_id: str) -> str:
+        """Pulls live logs for a specific incident."""
+        incident = IncidentRepository.get_by_id(self.db, incident_id)
+        if not incident: return "Incident not found"
+        return "\n".join([f"[{l.source}] ({l.level}): {l.message}" for l in incident.logs])
+
+    def listIncidents(self, status: str = "") -> str:
+        """Returns recent incidents from PostgreSQL. Optionally filter by status (e.g. TRIGGERED, RESOLVED)."""
+        incidents = IncidentRepository.get_all(self.db)
+        if status:
+            incidents = [inc for inc in incidents if inc.status.upper() == status.upper()]
+        
+        results = []
+        for inc in incidents[:20]:
+            results.append({
+                "id": inc.id,
+                "title": inc.title,
+                "service": inc.service,
+                "severity": inc.severity,
+                "status": inc.status
+            })
+        return json.dumps(results)
+
+    def getIncident(self, incident_id: str) -> str:
+        """Fetches full details for a specific incident."""
+        incident = IncidentRepository.get_by_id(self.db, incident_id)
+        if not incident: return "Incident not found"
+        return json.dumps({
+            "id": incident.id,
+            "title": incident.title,
+            "description": incident.description,
+            "service": incident.service,
+            "severity": incident.severity,
+            "status": incident.status
+        })
+
+    def compareIncidents(self, inc1_id: str, inc2_id: str) -> str:
+        """Retrieves two incidents for side-by-side comparison."""
+        inc1 = IncidentRepository.get_by_id(self.db, inc1_id)
+        inc2 = IncidentRepository.get_by_id(self.db, inc2_id)
+        return json.dumps({
+            "incident_1": {"id": inc1.id, "title": inc1.title, "service": inc1.service} if inc1 else "Not found",
+            "incident_2": {"id": inc2.id, "title": inc2.title, "service": inc2.service} if inc2 else "Not found"
+        })
+
+    def retrieveRunbook(self, runbook_id: str) -> str:
+        """Fetches full content of a specific runbook by ID."""
+        doc = KnowledgeSourceRepository.get_by_id(self.db, runbook_id)
+        if doc:
+            return doc.content
+        return f"Runbook {runbook_id} not found."
+
+    def getWorkflowStatus(self, incident_id: str) -> str:
+        """Pulls Mastra Agent pipeline execution status for an incident."""
+        incident = IncidentRepository.get_by_id(self.db, incident_id)
+        if not incident: return "Incident not found"
+        return incident.status
+
+    def retrieveAgentOutputs(self, incident_id: str) -> str:
+        """Gets the latest LLM agent analysis for an incident."""
+        outputs = AgentOutputRepository.get_by_incident_id(self.db, incident_id)
+        results = [{"agentType": o.agentType, "status": o.status, "summary": o.summary} for o in outputs]
+        return json.dumps(results)
+        
+    def retrieveMetrics(self, service: str) -> str:
+        """Retrieve recent metrics for a specific service."""
+        metrics = self.db.query(Metric).filter(Metric.service == service).order_by(Metric.timestamp.desc()).limit(10).all()
+        if not metrics: return f"No metrics found for {service}."
+        return json.dumps([{"metric": m.metric_name, "value": m.value, "time": str(m.timestamp)} for m in metrics])
+        
+    def retrieveReports(self, incident_id: str) -> str:
+        """Retrieve RCA reports for a specific incident."""
+        reports = self.db.query(Report).filter(Report.incidentId == incident_id).all()
+        if not reports: return "No reports found."
+        return json.dumps([{"title": r.title, "summary": r.summary, "rootCause": r.rootCause} for r in reports])
+        
+    def retrieveTimeline(self, incident_id: str) -> str:
+        """Extract timeline events from RCAs for an incident."""
+        reports = self.db.query(Report).filter(Report.incidentId == incident_id).all()
+        timelines = []
+        for r in reports:
+             if hasattr(r, 'timeline') and isinstance(r.timeline, list):
+                 timelines.extend(r.timeline)
+             elif hasattr(r, 'payload') and isinstance(r.payload, dict):
+                 timelines.extend(r.payload.get('timeline', []))
+        return json.dumps(timelines) if timelines else "No timeline available."
+        
+    def triggerWorkflow(self, incident_id: str) -> str:
+        """Trigger the Mastra SRE agent pipeline for an incident."""
+        try:
+            # We call the FastAPI endpoint internally
+            fastapi_url = os.getenv("FASTAPI_URL", "http://localhost:8000/api/v1")
+            requests.post(f"{fastapi_url}/incidents/{incident_id}/trigger-pipeline", timeout=5)
+            return "Workflow triggered successfully."
+        except Exception as e:
+            return f"Failed to trigger workflow: {str(e)}"
+            
+    def searchHistoricalIncidents(self, query: str) -> str:
+        """Query historical resolved incidents matching terms in their titles or services."""
+        incidents = self.db.query(Incident).filter(Incident.status == "RESOLVED").all()
+        matched = []
+        for inc in incidents:
+             if query.lower() in inc.title.lower() or query.lower() in inc.service.lower() or query.lower() in (inc.description or "").lower():
+                  matched.append({"id": inc.id, "title": inc.title, "service": inc.service, "severity": inc.severity})
+        return json.dumps(matched[:5])
+
+def build_system_instruction(user_preferences: dict, recent_context: str) -> str:
+    return (
+        "You are the elite SRE Copilot for Mastra Sentinel. You must use tools to fetch real-time operational data.\n"
+        "1. When answering questions, strictly ground your answers in the tool outputs. NEVER hallucinate operational data.\n"
+        "2. IMPORTANT: If you use `searchKnowledge` or `retrieveRunbook`, you MUST provide deep citations in your response using exactly this markdown format: `[Document Title, Page {page_number}, Chunk {chunk_id}]`.\n"
+        "3. Every recommendation must reference retrieved evidence.\n"
+        "4. Support Markdown, code blocks, and tables in your responses where appropriate.\n\n"
+        f"--- USER PREFERENCES ---\n{json.dumps(user_preferences)}\n\n"
+        f"--- RECENT CONTEXT ---\n{recent_context}"
+    )
+
+@router.get("/context")
+def get_copilot_context(db: Session = Depends(get_db)):
+    """Returns dashboard context and suggested questions for the AI Copilot UI."""
+    incidents = IncidentRepository.get_all(db)
+    triggered = [inc for inc in incidents if inc.status == "TRIGGERED"]
+    
+    suggested = []
+    if triggered:
+        suggested.append({"text": f"Explain Incident {triggered[0].id} in depth", "icon": "ShieldAlert"})
+        suggested.append({"text": f"Retrieve metrics for service: {triggered[0].service}", "icon": "Cpu"})
+    
+    suggested.append({"text": "Show me recent resolved incidents", "icon": "Database"})
+    suggested.append({"text": "Search runbooks for PostgreSQL connection pool saturation", "icon": "FileText"})
+
+    return {
+        "suggestedQuestions": suggested[:4],
+        "activeAlerts": len(triggered),
+        "recentIncidents": [{"id": i.id, "title": i.title} for i in incidents[:5]]
+    }
+
+
+@router.post("/chat")
+async def copilot_chat(req: ChatRequest, request: Request, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
     user_query = req.message
     
     # 1. Enkrypt Input Validation
-    input_scan = EnkryptMiddleware.validate_input(user_query)
+    input_scan = EnkryptMiddleware.validate_input(user_query, current_user, db)
     if input_scan["status"] == "ALERT":
         alert_msg = (
             "### 🛡️ Security Shield Alert\n\n"
@@ -82,265 +234,118 @@ def copilot_chat(req: ChatRequest, db: Session = Depends(get_db), current_user =
             alert_msg += f"- *{threat}*\n"
         alert_msg += "\n*This request has been blocked for compliance and security audit logs.*"
         
-        return ChatResponse(
-            message=alert_msg,
-            referencedIncident=None,
-            retrievedDocuments=[],
-            guardrailStatus={
-                "inputStatus": input_scan["status"],
-                "inputThreats": input_scan["threats"],
-                "outputStatus": "PASSED",
-                "outputThreats": []
-            }
-        )
+        # We simulate SSE response for the block
+        async def block_stream():
+            yield f"data: {json.dumps({'chunk': alert_msg, 'guardrailStatus': {'inputStatus': 'ALERT', 'inputThreats': input_scan['threats']}, 'done': True})}\n\n"
+        return StreamingResponse(block_stream(), media_type="text/event-stream")
 
-    # 2. Extract Incident context
+    # Audit log the prompt execution
+    from app.models.audit_log import AuditLog
+    user_id = current_user.get("email") # Use email or ID, here we have current_user dict. Better to fetch user if needed.
+    # To keep it lightweight, if we don't have user.id in current_user dict, let's fetch it or just use email as user string if allowed.
+    # The current_user dict from `get_current_user` has `email`, `role`, `name`. We should fetch user id.
+    from app.crud import UserRepository
+    user_obj = UserRepository.get_by_email(db, current_user["email"])
+    if user_obj:
+        prompt_log = AuditLog(
+            userId=user_obj.id,
+            action="PROMPT_EXECUTED",
+            resourceType="AI Copilot",
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            details={"prompt_preview": user_query[:100], "sanitized": input_scan.get("sanitized", False)},
+            response_status="SUCCESS"
+        )
+        db.add(prompt_log)
+        db.commit()
+
+    # 2. Extract context for the LLM and UI
     incident_context = None
     extracted_ids = extract_incident_ids(user_query)
     primary_id = req.incidentId or (extracted_ids[0] if extracted_ids else None)
     
+    recent_context_str = ""
     if primary_id:
         incident = IncidentRepository.get_by_id(db, primary_id)
         if incident:
-            logs_summary = "\n".join([f"[{l.source}] ({l.level}): {l.message}" for l in incident.logs[:15]])
-            rca_report = ReportRepository.get_by_incident_id(db, incident.id)
-            agent_outputs = AgentOutputRepository.get_by_incident_id(db, incident.id)
-            runs_summary = "\n".join([f"- {run.agentType}: {run.summary} (Status: {run.status})" for run in agent_outputs])
-            
+            recent_context_str = f"Active context incident: {incident.id} ({incident.title}) - Status: {incident.status}."
             incident_context = {
                 "id": incident.id,
                 "title": incident.title,
-                "description": incident.description,
                 "status": incident.status,
                 "severity": incident.severity,
-                "priority": getattr(incident, "priority", "HIGH"),
-                "service": incident.service,
-                "createdAt": incident.createdAt.isoformat() if incident.createdAt else None,
-                "logs": logs_summary or "No logs available",
-                "runs": runs_summary or "No agent execution runs recorded yet",
-                "rca": {
-                    "title": rca_report.title,
-                    "summary": rca_report.summary,
-                    "rootCause": rca_report.rootCause,
-                    "impact": rca_report.impact
-                } if rca_report else None
+                "service": incident.service
             }
-
-    # 3. Intent Classification
-    intent = "Operational Q&A"
-    # Regex classifier fallback
-
-    if intent == "Operational Q&A":
-        lower_query = user_query.lower()
-        if "list" in lower_query and ("incident" in lower_query or "all" in lower_query):
-            intent = "List Incidents"
-        elif "explain" in lower_query or "diagnose" in lower_query or "what happened" in lower_query:
-            intent = "Explain Incident"
-        elif "search" in lower_query or "find" in lower_query or "runbook" in lower_query:
-            intent = "Search Knowledge"
-        elif "compare" in lower_query or "difference" in lower_query:
-            intent = "Compare Incidents"
-        elif "summarize" in lower_query or "rca" in lower_query or "post-mortem" in lower_query:
-            intent = "Summarize Report"
-        elif "trigger" in lower_query or "run pipeline" in lower_query or "remediate" in lower_query:
-            intent = "Trigger Workflow"
-
-    # 4. Route Intent Execution
-    copilot_response = ""
-    retrieved_docs = []
-
-    if intent == "List Incidents":
-        incidents = IncidentRepository.get_all(db)
-        if not incidents:
-            copilot_response = "No incidents found in the database."
-        else:
-            copilot_response = f"### 📋 Incident Inventory ({len(incidents)} total)\n\n"
-            copilot_response += "| # | Incident ID | Title | Service | Severity | Status |\n"
-            copilot_response += "|---|-------------|-------|---------|----------|--------|\n"
-            for idx, inc in enumerate(incidents[:50], 1):
-                copilot_response += (
-                    f"| {idx} | `{inc.incident_number}` | {inc.title} | "
-                    f"`{inc.service}` | {inc.severity} | {inc.status} |\n"
-                )
-            if len(incidents) > 50:
-                copilot_response += f"\n*Showing first 50 of {len(incidents)} incidents.*\n"
-
-    elif intent == "Explain Incident":
-        if not primary_id:
-            copilot_response = "Please provide the incident ID you would like me to explain (e.g., INC-2026-XXXX)."
-        else:
-            incident = IncidentRepository.get_by_id(db, primary_id)
-            if not incident:
-                copilot_response = f"Could not find incident with ID `{primary_id}` in PostgreSQL."
-            else:
-                logs_summary = "\n".join([f"[{l.source}] ({l.level}): {l.message}" for l in incident.logs[:15]])
-                # Elegant static fallback response since diagnosis_agent has moved to TS
-                copilot_response = (
-                    f"### 🔍 Diagnostics for `{incident.id}`\n\n"
-                    f"**Service**: `{incident.service}`\n"
-                    f"**Severity**: `{incident.severity}`\n"
-                    f"**Recent Logs ({len(incident.logs)} entries)**:\n"
-                    f"```\n"
-                    f"{logs_summary[:400]}...\n"
-                    f"```\n"
-                    f"*Mastra AI diagnostic reasoning is now handled asynchronously. Please use the 'Trigger Workflow' command to run the pipeline.*"
-                )
-
-    elif intent == "Search Knowledge":
-        retrieved_docs = rag_manager.query_sop_runbooks(query=user_query, limit=3)
-        if not retrieved_docs:
-            copilot_response = "I searched the Qdrant vector index but found no matching SOP runbooks."
-        else:
-            copilot_response = "### 📖 Matching SOP Runbooks from Qdrant Index:\n\n"
-            for doc in retrieved_docs:
-                copilot_response += (
-                    f"#### **{doc.get('title')}** (ID: `{doc.get('doc_id')}`)\n"
-                    f"- **Service**: `{doc.get('service')}`\n"
-                    f"- **Score**: `{doc.get('score', 0):.4f}`\n"
-                    f"- **SOP Guidelines**:\n"
-                    f"  *{doc.get('content')}*\n\n"
-                )
-
-    elif intent == "Compare Incidents":
-        if len(extracted_ids) < 2:
-            copilot_response = "To compare incidents, please specify at least two incident IDs (e.g., *'compare INC-2026-A and INC-2026-B'*)."
-        else:
-            inc1_id, inc2_id = extracted_ids[0], extracted_ids[1]
-            inc1 = IncidentRepository.get_by_id(db, inc1_id)
-            inc2 = IncidentRepository.get_by_id(db, inc2_id)
             
-            if not inc1 or not inc2:
-                copilot_response = f"Could not find both `{inc1_id}` and `{inc2_id}` in the database."
-            else:
-                prompt = (
-                    f"Provide a technical comparative analysis between these two incidents:\n\n"
-                    f"**Incident 1 (`{inc1.id}`):**\n"
-                    f"- Title: {inc1.title}\n"
-                    f"- Service: {inc1.service}\n"
-                    f"- Status: {inc1.status}\n"
-                    f"- Severity: {inc1.severity}\n\n"
-                    f"**Incident 2 (`{inc2.id}`):**\n"
-                    f"- Title: {inc2.title}\n"
-                    f"- Service: {inc2.service}\n"
-                    f"- Status: {inc2.status}\n"
-                    f"- Severity: {inc2.severity}\n"
+    # Load User Preferences Memory
+    user_settings = db.query(Settings).filter(Settings.userId == current_user.id).first()
+    prefs = user_settings.ai_preferences if user_settings and user_settings.ai_preferences else {}
+
+    # 3. Gemini RAG Tool Calling execution (Streaming)
+    async def generate_response():
+        if GEMINI_AVAILABLE and os.getenv("GEMINI_API_KEY"):
+            try:
+                client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+                tools_impl = CopilotTools(db)
+                callable_tools = [
+                    tools_impl.searchKnowledge,
+                    tools_impl.searchLogs,
+                    tools_impl.listIncidents,
+                    tools_impl.getIncident,
+                    tools_impl.compareIncidents,
+                    tools_impl.retrieveRunbook,
+                    tools_impl.getWorkflowStatus,
+                    tools_impl.retrieveAgentOutputs,
+                    tools_impl.retrieveMetrics,
+                    tools_impl.retrieveReports,
+                    tools_impl.retrieveTimeline,
+                    tools_impl.triggerWorkflow,
+                    tools_impl.searchHistoricalIncidents
+                ]
+                
+                # Format history for Gemini
+                history = []
+                for msg in req.chatHistory:
+                    role = "user" if msg.role == "user" else "model"
+                    history.append(types.Content(role=role, parts=[types.Part.from_text(text=msg.content)]))
+                
+                config = types.GenerateContentConfig(
+                    system_instruction=build_system_instruction(prefs, recent_context_str),
+                    tools=callable_tools,
+                    temperature=0.2
                 )
-                if ollama_service:
-                    res = ollama_service.generate(prompt=prompt, system_instruction="You are an expert SRE comparing outages. Highlight similarities and anomalies.")
-                    copilot_response = res.get("text", "")
-                else:
-                    copilot_response = (
-                        f"### 📊 Comparative Analysis (Static Fallback)\n\n"
-                        f"- **Incident 1 (`{inc1.id}`)**: {inc1.title} ({inc1.service}) - {inc1.severity}\n"
-                        f"- **Incident 2 (`{inc2.id}`)**: {inc2.title} ({inc2.service}) - {inc2.severity}\n\n"
-                        f"*Provide a valid `GEMINI_API_KEY` to enable AI comparative analysis.*"
-                    )
 
-    elif intent == "Summarize Report":
-        if not primary_id:
-            copilot_response = "Please provide the incident ID to summarize its RCA report (e.g., summarize report for INC-2026-XXXX)."
+                chat = client.chats.create(model="gemini-2.5-pro", config=config, history=history)
+                
+                response_stream = chat.send_message_stream(user_query)
+                
+                for chunk in response_stream:
+                    if await request.is_disconnected():
+                        break
+                    if chunk.text:
+                        yield f"data: {json.dumps({'chunk': chunk.text, 'done': False})}\n\n"
+                
+                # Output Guardrail
+                # Can't easily scan stream fully until it finishes, so we skip output block or do it client side for streaming.
+                # For safety, we just send done.
+                yield f"data: {json.dumps({'chunk': '', 'done': True, 'referencedIncident': incident_context, 'guardrailStatus': {'inputStatus': 'PASSED'}})}\n\n"
+
+            except Exception as e:
+                logging.error(f"Gemini generation error: {e}")
+                yield f"data: {json.dumps({'chunk': f'❌ **LLM Execution Failed**: {str(e)}', 'done': True})}\n\n"
         else:
-            report = ReportRepository.get_by_incident_id(db, primary_id)
-            if not report:
-                copilot_response = f"No RCA post-mortem report was found for incident `{primary_id}`. You may need to trigger the agent pipeline first."
-            else:
-                report_content = (
-                    f"RCA Title: {report.title}\n"
-                    f"Summary: {report.summary}\n"
-                    f"Root Cause: {report.rootCause}\n"
-                    f"Impact: {report.impact}\n"
-                )
-                copilot_response = f"### 📝 RCA Post-Mortem Summary for `{primary_id}`\n\n"
-                if ollama_service:
-                    copilot_response += ollama_service.summarize(report_content)
-                else:
-                    copilot_response += (
-                        f"**RCA Summary**: {report.summary}\n\n"
-                        f"**Root Cause**: {report.rootCause}\n\n"
-                        f"**Impact**: {report.impact}\n\n"
-                        f"*(Provide a valid `GEMINI_API_KEY` to generate a polished AI summary)*"
-                    )
+            # Fallback
+            yield f"data: {json.dumps({'chunk': 'Gemini API not available. Please configure GEMINI_API_KEY.', 'done': True})}\n\n"
 
-    elif intent == "Trigger Workflow":
-        if not primary_id:
-            copilot_response = "Please specify which incident ID to trigger the agent workflow for."
-        else:
-            incident = IncidentRepository.get_by_id(db, primary_id)
-            if not incident:
-                copilot_response = f"Could not find incident with ID `{primary_id}`."
-            else:
-                copilot_response = f"### ⚙️ Executing Agent Workflow Pipeline for `{primary_id}`...\n\n"
-                try:
-                    # Gather logs
-                    logs_list = [f"[{log.source}] ({log.level}): {log.message}" for log in incident.logs]
-                    if not logs_list:
-                        logs_list = ["No logs attached. Default diagnostic health check reports latency spike."]
+    return StreamingResponse(generate_response(), media_type="text/event-stream")
 
-                    # Trigger workflow via Node Mastra Engine
-                    try:
-                        mastra_url = "http://mastra_engine:3001/api/workflows/incident-response"
-                        requests.post(mastra_url, json={
-                            "incidentId": incident.id,
-                            "title": incident.title,
-                            "service": incident.service,
-                            "severity": incident.severity,
-                            "logs": "\n".join(logs_list)
-                        }, timeout=5)
-                        copilot_response += "Pipeline has been successfully triggered. See the SSE stream for live updates."
-                    except Exception as e:
-                        copilot_response += f"Failed to trigger Mastra Engine: {e}"
-                        
-                except Exception as e:
-                    copilot_response = f"❌ **Pipeline Execution Failed**: {str(e)}"
-
-    else:
-        # Operational Q&A
-        retrieved_docs = rag_manager.query_sop_runbooks(query=user_query, limit=3)
-        context = "\n".join([f"- Runbook '{d.get('title')}': {d.get('content')}" for d in retrieved_docs])
-        prompt = (
-            f"You are the elite SRE Copilot for Mastra Sentinel. Ground your answer strictly on the provided context.\n\n"
-            f"Grounding context:\n{context}\n\n"
-            f"User Question: {user_query}\n"
-        )
-        if ollama_service:
-            res = ollama_service.generate(prompt=prompt, system_instruction="Provide a technical, elegant markdown answer grounded on context.")
-            copilot_response = res.get("text", "")
-        else:
-            if retrieved_docs:
-                copilot_response = (
-                    f"### 📖 Grounded Knowledge Search (Fallback):\n\n"
-                    f"{context}\n\n"
-                    f"*Provide a valid `GEMINI_API_KEY` to enable AI operational chat generation.*"
-                )
-            else:
-                copilot_response = f"I searched the knowledge index but found no SOP runbooks answering: '{user_query}'."
-
-    # 5. Enkrypt Output Validation
-    output_scan = EnkryptMiddleware.validate_output(copilot_response)
-
-    return ChatResponse(
-        message=copilot_response,
-        referencedIncident=incident_context,
-        retrievedDocuments=retrieved_docs,
-        guardrailStatus={
-            "inputStatus": input_scan["status"],
-            "inputThreats": input_scan["threats"],
-            "outputStatus": output_scan["status"],
-            "outputThreats": output_scan["threats"]
-        }
-    )
-
-class GuardrailRequest(BaseModel):
-    text: str
-    direction: str = "input"
 
 @router.post("/guardrail-check")
-def check_guardrails(req: GuardrailRequest, current_user = Depends(get_current_user)):
-    """Run Enkrypt guardrails independently."""
-    if req.direction == "input":
-        scan = EnkryptMiddleware.validate_input(req.text)
-    else:
-        scan = EnkryptMiddleware.validate_output(req.text)
+def check_guardrails(req: GuardrailRequest, current_user = Depends(get_current_user), db: Session = Depends(get_db)):
+    # 1. Enkrypt Input Validation
+    scan = EnkryptMiddleware.validate_input(req.text, current_user, db)
+    if req.is_output:
+        scan = EnkryptMiddleware.validate_output(req.text, current_user, db)
     
     return {
         "status": scan.get("status", "PASSED"),

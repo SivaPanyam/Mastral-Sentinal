@@ -3,12 +3,11 @@ FROM node:18-alpine
 WORKDIR /app
 
 COPY package.json package-lock.json* ./
-RUN npm install
+RUN npm install --legacy-peer-deps
 
 COPY . .
 
-RUN npx tsc
-
+RUN npm install -g tsx
 EXPOSE 3000
 
-CMD ["node", "dist/server.js"]
+CMD ["tsx", "src/server.ts"]

@@ -1,0 +1,130 @@
+rules:
+  - id: rule-repeated-error
+    name: "Repeated ERROR messages"
+    description: "Triggers when there are 5 or more ERROR logs within a 1 minute window for the same service."
+    severity: "HIGH"
+    condition:
+      field: "severity"
+      operator: "in"
+      value: ["ERROR", "CRITICAL", "FATAL"]
+    threshold: 5
+    time_window_seconds: 60
+    enabled: true
+    group_by: ["service"]
+
+  - id: rule-http-500
+    name: "HTTP 500 threshold"
+    description: "Triggers when there are HTTP 5xx errors."
+    severity: "HIGH"
+    condition:
+      field: "message"
+      operator: "regex"
+      value: "HTTP/1\\.[01]\" 50[0-9]"
+    threshold: 10
+    time_window_seconds: 60
+    enabled: true
+    group_by: ["service"]
+
+  - id: rule-db-timeout
+    name: "Database timeout"
+    description: "Triggers on DB timeout."
+    severity: "CRITICAL"
+    condition:
+      field: "message"
+      operator: "contains"
+      value: "timeout"
+    threshold: 1
+    time_window_seconds: 0
+    enabled: true
+    group_by: ["service"]
+
+  - id: rule-service-unavailable
+    name: "Service unavailable"
+    description: "Triggers when a service is unavailable."
+    severity: "CRITICAL"
+    condition:
+      field: "message"
+      operator: "contains"
+      value: "Service Unavailable"
+    threshold: 1
+    time_window_seconds: 0
+    enabled: true
+    group_by: ["service"]
+
+  - id: rule-memory-threshold
+    name: "Memory threshold"
+    description: "Triggers on memory limits."
+    severity: "HIGH"
+    condition:
+      field: "message"
+      operator: "contains"
+      value: "Out of memory"
+    threshold: 1
+    time_window_seconds: 0
+    enabled: true
+    group_by: ["service"]
+
+  - id: rule-cpu-threshold
+    name: "CPU threshold"
+    description: "CPU high usage alert."
+    severity: "MEDIUM"
+    condition:
+      field: "message"
+      operator: "contains"
+      value: "CPU usage exceeded"
+    threshold: 1
+    time_window_seconds: 0
+    enabled: true
+    group_by: ["service"]
+
+  - id: rule-auth-failures
+    name: "Repeated authentication failures"
+    description: "Triggers on repeated auth failures."
+    severity: "HIGH"
+    condition:
+      field: "message"
+      operator: "contains"
+      value: "Authentication failed"
+    threshold: 5
+    time_window_seconds: 60
+    enabled: true
+    group_by: ["service"]
+
+  - id: rule-disk-space
+    name: "Disk space threshold"
+    description: "Triggers on disk space full."
+    severity: "CRITICAL"
+    condition:
+      field: "message"
+      operator: "contains"
+      value: "No space left on device"
+    threshold: 1
+    time_window_seconds: 0
+    enabled: true
+    group_by: ["service"]
+
+  - id: rule-app-crash
+    name: "Application crash"
+    description: "Triggers on application crash."
+    severity: "CRITICAL"
+    condition:
+      field: "message"
+      operator: "regex"
+      value: "(?i)(segmentation fault|core dumped|panic:)"
+    threshold: 1
+    time_window_seconds: 0
+    enabled: true
+    group_by: ["service"]
+
+  - id: rule-conn-timeout
+    name: "Connection timeout"
+    description: "Triggers on connection timeout."
+    severity: "MEDIUM"
+    condition:
+      field: "message"
+      operator: "contains"
+      value: "Connection timed out"
+    threshold: 1
+    time_window_seconds: 0
+    enabled: true
+    group_by: ["service"]

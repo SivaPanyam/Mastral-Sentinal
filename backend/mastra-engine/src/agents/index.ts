@@ -1,5 +1,5 @@
 import { Agent } from '../mastra';
-import { knowledgeSearchTool, databaseTool, reportTool, guardrailTool } from '../tools';
+import { knowledgeSearchTool, databaseTool, reportTool, guardrailTool, indexKnowledgeTool } from '../tools';
 // Using Gemini from AI SDK for Mastra
 import { google } from '@ai-sdk/google';
 import {
@@ -45,5 +45,5 @@ export const knowledgeAgent = new Agent({
   name: 'KnowledgeAgent',
   instructions: buildAgentInstructions(KnowledgePrompt),
   model: model,
-  tools: { guardrailTool }
+  tools: { indexKnowledgeTool, guardrailTool }
 });

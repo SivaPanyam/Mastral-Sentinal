@@ -1,9 +1,11 @@
+import os
 import time
 import datetime
-from fastapi import FastAPI, Depends, HTTPException, status
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Depends, HTTPException, status, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import func, text
 from app.config import settings
 from app.database import engine, Base, get_db
 from app.auth import (
@@ -22,25 +24,46 @@ from app.schemas import (
     MetricPointOut,
     SystemOverviewOut
 )
-from app.routes import incidents, agents, knowledge, reports, copilot, users, settings as settings_routes, audit_logs, metrics, seeder
+from app.routes import incidents, agents, knowledge, reports, copilot, users, settings as settings_routes, audit_logs, metrics, seeder, ingestion, auth_routes, api_keys
+from app.ws import global_ws_manager
+from app.log_sources import log_manager
 from app.models import User, Incident, KnowledgeSource, Report
 from app.crud import UserRepository
+from app.telemetry import setup_telemetry
+from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
 from typing import List, Dict, Any
+
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi_pagination import add_pagination
+from fastapi_cache import FastAPICache
+from fastapi_cache.backends.redis import RedisBackend
+import redis.asyncio as redis_async
+from app.logger import setup_structlog, logger
+
+setup_structlog()
 
 # Create tables automatically on startup
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(
-    title=settings.PROJECT_NAME,
-    description="Sentinel Core Platform API - Autonomous AI-driven SRE Incident Response Control Plane",
-    version="1.0.0",
-    docs_url="/api/docs",
-    redoc_url="/api/redoc"
-)
-
-# Seed initial users on startup
-@app.on_event("startup")
-def seed_users():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Instrument SQLAlchemy here after engine is initialized
+    SQLAlchemyInstrumentor().instrument(
+        engine=engine,
+        enable_commenter=True,
+        commenter_options={}
+    )
+    
+    # Initialize Redis Cache
+    redis_client = redis_async.from_url("redis://localhost:6379", encoding="utf-8", decode_responses=True)
+    FastAPICache.init(RedisBackend(redis_client), prefix="fastapi-cache")
+    logger.info("Redis cache initialized")
+    
+    # --- Startup ---
+    log_manager.initialize_from_config()
+    await log_manager.connect_all()
+    logger.info("Log sources connected")
+    
     db = next(get_db())
     try:
         # Seed Admin
@@ -51,7 +74,7 @@ def seed_users():
                 username="admin",
                 email="admin@sentinel.dev",
                 name="Admin User",
-                hashed_password=get_password_hash("SreSentinel2026!"),
+                hashed_password=get_password_hash(os.getenv("DEFAULT_ADMIN_PASSWORD", "admin_password")),
                 role="Admin"
             )
             UserRepository.create(db, admin_user)
@@ -68,7 +91,7 @@ def seed_users():
                 username="operator",
                 email="operator@sentinel.ai",
                 name="Operator Lead",
-                hashed_password=get_password_hash("OperatorSecure!"),
+                hashed_password=get_password_hash(os.getenv("DEFAULT_OPERATOR_PASSWORD", "operator_password")),
                 role="SRE"
             )
             UserRepository.create(db, operator_user)
@@ -85,7 +108,7 @@ def seed_users():
                 username="analyst",
                 email="analyst@sentinel.ai",
                 name="Security Analyst",
-                hashed_password=get_password_hash("AnalystSecure!"),
+                hashed_password=get_password_hash(os.getenv("DEFAULT_ANALYST_PASSWORD", "analyst_password")),
                 role="Security Analyst"
             )
             UserRepository.create(db, analyst_user)
@@ -102,7 +125,7 @@ def seed_users():
                 username="devops",
                 email="devops@sentinel.ai",
                 name="DevOps Engineer",
-                hashed_password=get_password_hash("DevopsSecure!"),
+                hashed_password=get_password_hash(os.getenv("DEFAULT_DEVOPS_PASSWORD", "devops_password")),
                 role="DevOps"
             )
             UserRepository.create(db, devops_user)
@@ -119,7 +142,7 @@ def seed_users():
                 username="viewer",
                 email="viewer@sentinel.ai",
                 name="Guest Viewer",
-                hashed_password=get_password_hash("ViewerSecure!"),
+                hashed_password=get_password_hash(os.getenv("DEFAULT_VIEWER_PASSWORD", "viewer_password")),
                 role="Viewer"
             )
             UserRepository.create(db, viewer_user)
@@ -130,6 +153,37 @@ def seed_users():
             
     except Exception as e:
         print(f"Error seeding database users: {e}")
+        
+    yield
+    
+    # --- Shutdown ---
+    await log_manager.disconnect_all()
+    await redis_client.aclose()
+    logger.info("Application shutdown gracefully")
+
+
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
+limiter = Limiter(key_func=get_remote_address)
+
+app = FastAPI(
+    title=settings.PROJECT_NAME,
+    description="Sentinel Core Platform API - Autonomous AI-driven SRE Incident Response Control Plane",
+    version="1.0.0",
+    docs_url="/api/docs",
+    redoc_url="/api/redoc",
+    lifespan=lifespan
+)
+
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+setup_telemetry(app)
+
+# Setup GZip Compression
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # Setup CORS for the React frontend
 app.add_middleware(
@@ -160,7 +214,21 @@ app.include_router(settings_routes.router, prefix=settings.API_V1_STR)
 app.include_router(audit_logs.router, prefix=settings.API_V1_STR)
 app.include_router(metrics.router, prefix=settings.API_V1_STR)
 app.include_router(seeder.router, prefix=settings.API_V1_STR)
+app.include_router(ingestion.router, prefix=settings.API_V1_STR)
+app.include_router(auth_routes.router, prefix=settings.API_V1_STR)
+app.include_router(api_keys.router, prefix=settings.API_V1_STR)
 
+# Add pagination support globally
+add_pagination(app)
+
+@app.websocket(f"{settings.API_V1_STR}/ws/events")
+async def websocket_endpoint(websocket: WebSocket):
+    await global_ws_manager.connect(websocket)
+    try:
+        while True:
+            data = await websocket.receive_text()
+    except WebSocketDisconnect:
+        global_ws_manager.disconnect(websocket)
 
 from fastapi.responses import RedirectResponse
 
@@ -178,57 +246,20 @@ def health_check():
         "service": "Mastra Sentinel Core API"
     }
 
+@app.get("/health/live", tags=["Platform Health"])
+def health_live():
+    """Liveness probe to verify process is running."""
+    return {"status": "UP"}
 
-@app.post("/auth/login", response_model=Token, tags=["Authentication"])
-def login(user_data: UserLogin, db: Session = Depends(get_db)):
-    """Authenticate SRE admins and operators, returning JWT access and refresh tokens."""
-    user = UserRepository.get_by_email(db, user_data.email)
-    if not user or not verify_password(user_data.password, user.hashed_password):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password configured inside Mastra Sentinel"
-        )
-    
-    access_token = create_access_token(
-        data={"sub": user.email, "role": user.role, "name": user.name}
-    )
-    refresh_token = create_refresh_token(
-        data={"sub": user.email}
-    )
-    return {
-        "access_token": access_token,
-        "token_type": "bearer",
-        "email": user.email,
-        "role": user.role,
-        "refresh_token": refresh_token
-    }
+@app.get("/health/ready", tags=["Platform Health"])
+def health_ready(db: Session = Depends(get_db)):
+    """Readiness probe to verify database and downstream dependencies."""
+    try:
+        db.execute(text("SELECT 1"))
+        return {"status": "READY"}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail="Database unavailable")
 
-
-@app.post("/auth/refresh", response_model=Token, tags=["Authentication"])
-def refresh_token_endpoint(req: TokenRefreshRequest, db: Session = Depends(get_db)):
-    """Refresh an expired access token using a valid refresh token."""
-    payload = verify_refresh_token(req.refresh_token)
-    email = payload.get("sub")
-    if not email:
-        raise HTTPException(status_code=401, detail="Invalid refresh token payload")
-        
-    user = UserRepository.get_by_email(db, email)
-    if not user:
-        raise HTTPException(status_code=401, detail="User not found")
-        
-    access_token = create_access_token(
-        data={"sub": user.email, "role": user.role, "name": user.name}
-    )
-    new_refresh_token = create_refresh_token(
-        data={"sub": user.email}
-    )
-    return {
-        "access_token": access_token,
-        "token_type": "bearer",
-        "email": user.email,
-        "role": user.role,
-        "refresh_token": new_refresh_token
-    }
 
 
 # High fidelity telemetry metrics endpoints for standard dashboards

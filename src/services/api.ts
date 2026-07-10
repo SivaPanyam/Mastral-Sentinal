@@ -5,8 +5,8 @@
  */
 
 const API_BASE = ''; // Relative path because of Vite server proxying
-const DEFAULT_EMAIL = 'sivapanyam1@gmail.com';
-const DEFAULT_PASSWORD = 'SreSentinel2026!';
+const DEFAULT_EMAIL = import.meta.env.VITE_DEFAULT_EMAIL || '';
+const DEFAULT_PASSWORD = import.meta.env.VITE_DEFAULT_PASSWORD || '';
 
 let cachedToken: string | null = localStorage.getItem('sentinel_jwt_token');
 
