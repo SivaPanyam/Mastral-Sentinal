@@ -58,7 +58,7 @@ jobs:
         SECRET_KEY: test_secret_key_ci
         OLLAMA_BASE_URL: http://localhost:11434
       run: |
-        pytest tests/ -v
+        python -m pytest tests/ -v
         
   build:
     needs: test
