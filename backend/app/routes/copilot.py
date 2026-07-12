@@ -357,9 +357,16 @@ async def copilot_chat(req: ChatRequest, request: Request, db: Session = Depends
                 yield f"data: {json.dumps({'chunk': f'❌ **LLM Execution Failed**: {str(e)}', 'done': True})}\n\n"
         else:
             # Fallback to Ollama
-            yield f"data: {json.dumps({'chunk': '*(Using Local Ollama)*\n\n', 'done': False})}\n\n"
+            fallback_notice = json.dumps({"chunk": "*(Using Local Ollama)*\n\n", "done": False})
+            yield f"data: {fallback_notice}\n\n"
             response = ollama_service.generate(prompt=user_query, system_instruction=build_system_instruction(prefs, recent_context_str))
-            yield f"data: {json.dumps({'chunk': response.get('text', 'Error from Ollama'), 'done': True, 'referencedIncident': incident_context, 'guardrailStatus': {'inputStatus': 'PASSED'}})}\n\n"
+            fallback_response = json.dumps({
+                "chunk": response.get("text", "Error from Ollama"),
+                "done": True,
+                "referencedIncident": incident_context,
+                "guardrailStatus": {"inputStatus": "PASSED"},
+            })
+            yield f"data: {fallback_response}\n\n"
 
     return StreamingResponse(generate_response(), media_type="text/event-stream")
 
