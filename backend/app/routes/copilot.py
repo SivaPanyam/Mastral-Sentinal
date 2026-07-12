@@ -44,27 +44,43 @@ class GuardrailRequest(BaseModel):
     text: str
     direction: str = "input"
 
-# Ollama Fallback Service
-class OllamaService:
+
+def _get_attr_or_key(value: Any, field: str, default: Any = None) -> Any:
+    if isinstance(value, dict):
+        return value.get(field, default)
+    return getattr(value, field, default)
+
+# Featherless AI Service
+class FeatherlessAIService:
     def __init__(self):
-        self.base_url = os.getenv("OLLAMA_BASE_URL", settings.OLLAMA_BASE_URL).rstrip("/")
-        self.endpoint = f"{self.base_url}/api/generate"
+        self.api_key = settings.FEATHERLESS_API_KEY
+        self.base_url = "https://api.featherless.ai/v1"
+        self.endpoint = f"{self.base_url}/chat/completions"
 
     def generate(self, prompt, system_instruction=None):
         try:
-            full_prompt = prompt if not system_instruction else f"{system_instruction}\n\n{prompt}"
+            messages = []
+            if system_instruction:
+                messages.append({"role": "system", "content": system_instruction})
+            messages.append({"role": "user", "content": prompt})
+            
             payload = {
-                "model": "llama3.2",
-                "prompt": full_prompt,
+                "model": "deepseek-ai/DeepSeek-V3.1-Terminus",
+                "messages": messages,
                 "stream": False
             }
-            response = requests.post(self.endpoint, json=payload, timeout=60)
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json"
+            }
+            response = requests.post(self.endpoint, json=payload, headers=headers, timeout=60)
             response.raise_for_status()
-            return {"text": response.json().get("response", "")}
+            data = response.json()
+            return {"text": data.get("choices", [{}])[0].get("message", {}).get("content", "")}
         except Exception as e:
-            return {"text": f"Error generating text: {str(e)}"}
+            return {"text": f"Error generating text via Featherless AI: {str(e)}"}
             
-ollama_service = OllamaService()
+ollama_service = FeatherlessAIService()
 
 def extract_incident_ids(text: str) -> List[str]:
     matches = re.findall(r"\b(INC-2026-\w+|INC-\w+|INC\d{4,})\b", text, re.IGNORECASE)
@@ -172,8 +188,10 @@ class CopilotTools:
         """Trigger the Mastra SRE agent pipeline for an incident."""
         try:
             # We call the FastAPI endpoint internally
-            fastapi_url = os.getenv("FASTAPI_URL", "http://localhost:8000/api/v1")
-            requests.post(f"{fastapi_url}/incidents/{incident_id}/trigger-pipeline", timeout=5)
+            requests.post(
+                f"{settings.MASTRA_FASTAPI_URL}/incidents/{incident_id}/trigger-pipeline",
+                timeout=5,
+            )
             return "Workflow triggered successfully."
         except Exception as e:
             return f"Failed to trigger workflow: {str(e)}"
@@ -241,14 +259,12 @@ async def copilot_chat(req: ChatRequest, request: Request, db: Session = Depends
 
     # Audit log the prompt execution
     from app.models.audit_log import AuditLog
-    user_id = current_user.get("email") # Use email or ID, here we have current_user dict. Better to fetch user if needed.
-    # To keep it lightweight, if we don't have user.id in current_user dict, let's fetch it or just use email as user string if allowed.
-    # The current_user dict from `get_current_user` has `email`, `role`, `name`. We should fetch user id.
     from app.crud import UserRepository
     user_obj = UserRepository.get_by_email(db, current_user["email"])
+    user_id = _get_attr_or_key(user_obj, "id") or current_user.get("id") or current_user.get("email")
     if user_obj:
         prompt_log = AuditLog(
-            userId=user_obj.id,
+            userId=user_id,
             action="PROMPT_EXECUTED",
             resourceType="AI Copilot",
             ip_address=request.client.host if request.client else None,
@@ -268,17 +284,23 @@ async def copilot_chat(req: ChatRequest, request: Request, db: Session = Depends
     if primary_id:
         incident = IncidentRepository.get_by_id(db, primary_id)
         if incident:
-            recent_context_str = f"Active context incident: {incident.id} ({incident.title}) - Status: {incident.status}."
+            incident_id = _get_attr_or_key(incident, "id")
+            incident_title = _get_attr_or_key(incident, "title")
+            incident_status = _get_attr_or_key(incident, "status")
+            incident_severity = _get_attr_or_key(incident, "severity")
+            incident_service = _get_attr_or_key(incident, "service")
+
+            recent_context_str = f"Active context incident: {incident_id} ({incident_title}) - Status: {incident_status}."
             incident_context = {
-                "id": incident.id,
-                "title": incident.title,
-                "status": incident.status,
-                "severity": incident.severity,
-                "service": incident.service
+                "id": incident_id,
+                "title": incident_title,
+                "status": incident_status,
+                "severity": incident_severity,
+                "service": incident_service
             }
             
     # Load User Preferences Memory
-    user_settings = db.query(Settings).filter(Settings.userId == current_user.id).first()
+    user_settings = db.query(Settings).filter(Settings.userId == user_id).first() if user_id else None
     prefs = user_settings.ai_preferences if user_settings and user_settings.ai_preferences else {}
 
     # 3. Gemini RAG Tool Calling execution (Streaming)
@@ -334,8 +356,10 @@ async def copilot_chat(req: ChatRequest, request: Request, db: Session = Depends
                 logging.error(f"Gemini generation error: {e}")
                 yield f"data: {json.dumps({'chunk': f'❌ **LLM Execution Failed**: {str(e)}', 'done': True})}\n\n"
         else:
-            # Fallback
-            yield f"data: {json.dumps({'chunk': 'Gemini API not available. Please configure GEMINI_API_KEY.', 'done': True})}\n\n"
+            # Fallback to Ollama
+            yield f"data: {json.dumps({'chunk': '*(Using Local Ollama)*\n\n', 'done': False})}\n\n"
+            response = ollama_service.generate(prompt=user_query, system_instruction=build_system_instruction(prefs, recent_context_str))
+            yield f"data: {json.dumps({'chunk': response.get('text', 'Error from Ollama'), 'done': True, 'referencedIncident': incident_context, 'guardrailStatus': {'inputStatus': 'PASSED'}})}\n\n"
 
     return StreamingResponse(generate_response(), media_type="text/event-stream")
 
@@ -344,7 +368,7 @@ async def copilot_chat(req: ChatRequest, request: Request, db: Session = Depends
 def check_guardrails(req: GuardrailRequest, current_user = Depends(get_current_user), db: Session = Depends(get_db)):
     # 1. Enkrypt Input Validation
     scan = EnkryptMiddleware.validate_input(req.text, current_user, db)
-    if req.is_output:
+    if req.direction == "output":
         scan = EnkryptMiddleware.validate_output(req.text, current_user, db)
     
     return {
