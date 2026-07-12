@@ -1,8 +1,8 @@
 from pathlib import Path
-from typing import List
+from typing import Annotated, List
 
 from pydantic import Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 ROOT_ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
 
@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "INFO"
     FRONTEND_URL: str = "http://localhost:3000"
     BACKEND_PUBLIC_URL: str = "http://localhost:8000"
-    ALLOWED_CORS_ORIGINS: List[str] = Field(default_factory=lambda: ["http://localhost:3000"])
+    ALLOWED_CORS_ORIGINS: Annotated[List[str], NoDecode] = Field(default_factory=lambda: ["http://localhost:3000"])
     
     # Security
     SECRET_KEY: str
